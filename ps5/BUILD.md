@@ -4,7 +4,7 @@ Built on Linux (Ubuntu 24.04), like the other ports.
 
 ## What you need
 
-- clang 19, lld 19, CMake 3.25+, Ninja, Python 3, git
+- clang 19, lld 19, LLVM 19 tools (`llvm-config-19`), CMake 3.25+, Ninja, Python 3, git
 - Nazky's [ps5-plume-triangle](https://github.com/Nazky/ps5-plume-triangle), built once with `tools/build.sh`
   (the PS5 payload SDK, RADV, the app CRT and the signer)
 - DXC 1.9 for Linux (1.8 crashes on the Bink video shaders):
@@ -49,7 +49,9 @@ The app ends up in `out/ps5/ps5-app/PPSA94004`. Copy it to `/data/homebrew/` on 
 The FidelityFX lines add FSR 3 (the hub's Frame Generation option). They need Wine
 (`apt install wine64`) for AMD's shader compiler, plus spirv-tools and glslang. The
 first build compiles about 2,700 motion-vector shader variants, which takes a while.
-Leave those four lines out to build without FSR 3.
+Leave out `-DREXGLUE_ENABLE_FIDELITYFX=ON` and
+`-DGTA4_TEMPORAL_ZSTD_LIBRARY=...` to build without FSR 3. Keep the
+`spirv-val` and `glslangValidator` options: the regular shader cache also needs them.
 
 The hub draws its tabs in Helvetica Neue Heavy, as the episodes' menus do.
 Its licence doesn't allow sharing it, so it isn't in this repo: put your own
@@ -62,6 +64,8 @@ use the hub's usual type.
 - `install/`: your GTA IV disc image (USA, .iso) and Title Update 8. The game installs itself from them the first time.
 - `import/`: Xbox 360 save files, imported from the hub's Saves page.
 - `logs/`: the log, and frame time captures when they're on.
+- `mods/game/`: optional Xbox 360 replacement files, enabled by **Game → Mods**
+  in the hub. See [mod setup and limitations](../docs/MOD_SUPPORT.md#ps5-port).
 
 ## Where things are
 

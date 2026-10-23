@@ -1,5 +1,86 @@
 # Liberty Recompiled - Mod Support
 
+## PS5 port
+
+The PS5 uses the ReXGlue runtime. The older desktop overlay API and configuration
+documented below are separate from the PS5 feature.
+
+1. Use an Xbox 360 mod pack made for the USA release, Title Update 8 and the
+   episode you plan to play.
+2. Locate the files it replaces under
+   `/data/homebrew/PPSA94004/UserData/LibertyRecomp/game/`.
+3. Copy the replacements to `/data/homebrew/PPSA94004/mods/game/`, preserving
+   their relative paths. For example, a file at
+   `UserData/LibertyRecomp/game/<path>/script.img` is replaced by
+   `mods/game/<path>/script.img`. Files under `game/update/` need the same
+   `update/` prefix under `mods/game/`.
+4. Enable **Game → Mods** in the hub and launch the game. Use the menu pack's
+   controller shortcut to open it. Quit and restart the app after changing files.
+
+Mods default to Off. The loader mounts replacement files read-only and redirects
+game filesystem requests before the guest starts. The loader leaves installed
+game files and save files untouched. Startup logs list every replacement and path errors.
+To recover from a broken pack, turn Mods off in the hub and restart.
+
+### Script menus
+
+The recompiled game retains the Xbox 360 script VM. A replacement `script.img`
+or `script_network.img` can supply modified scripts, but the pack must include
+a bootstrap that starts its menu in the intended game mode. Dropping a new
+`.sco` into the folder does **not** register or start it. Use one menu pack at
+a time; this loader does not merge archives or provide a universal menu shortcut.
+
+Compatibility is experimental until a particular pack has been tested on PS5.
+PC `.asi` plugins, ScriptHook DLLs, .NET scripts, PS3 menu binaries and native
+Xbox 360 executables require different runtimes or ports. Episode-specific
+scripts and hardcoded memory addresses can also make a pack incompatible.
+Packs changing the phone script may disable the built-in Quicksave patch for
+that script.
+
+### File replacement limits
+
+- Only files opened through the guest filesystem are redirected. A loose file
+  does not replace a member inside an IMG/RPF archive. Replace the container
+  that the game actually opens when necessary.
+- This first version targets the base game's `game:`/`d:` mounts and its
+  `update:` files. It does not redirect the separately mounted episode packages
+  under `UserData/LibertyRecomp/dlc/`.
+- A replacement `xbox360.rpf` takes priority over the generated PlayStation
+  button-prompt archive.
+- Native executable files, keys, installation metadata, hidden paths, README
+  files and symlinks are skipped. Case-insensitive filename collisions are
+  skipped and logged. File contents are not validated for game compatibility.
+- No game files or third-party menus are included.
+
+To check file discovery on a Linux host without the PS5 SDK:
+
+```sh
+g++ -std=c++17 -Wall -Wextra -Werror \
+  -Iglue/rexglue-sdk-main/gta4-recomp/src/ps5/game \
+  ps5/tests/mod_files_test.cpp \
+  glue/rexglue-sdk-main/gta4-recomp/src/ps5/game/mod_files.cpp \
+  -o /tmp/gta4-mod-files-test
+/tmp/gta4-mod-files-test
+
+# Reproduce the PS5 refusing lstat while retaining cached directory entry types.
+cc -shared -fPIC ps5/tests/mod_files_lstat_denied.c -o /tmp/gta4-deny-lstat.so
+LD_PRELOAD=/tmp/gta4-deny-lstat.so /tmp/gta4-mod-files-test
+```
+
+The [loader integration check](../ps5/tests/mod_loader_test.cpp) and
+[VFS regression check](../ps5/tests/vfs_mod_links_test.cpp) include their host
+compile commands. They exercise file selection, mounting, and path redirection;
+they do not establish compatibility with a particular menu on PS5.
+
+The [save-write regression](../ps5/tests/vfs_save_writes_test.cpp) uses the real
+VFS, writable HostPathDevice and POSIX file I/O. Its included Linux build command
+checks existing saves, directory-relative creation and overwrite, nested paths,
+and read-only mod isolation. Only logging and configuration registration are stubbed.
+
+The PS5 executable still needs the SDK and build steps in [ps5/BUILD.md](../ps5/BUILD.md).
+
+---
+
 ## Overview
 
 Liberty Recompiled includes built-in support for mods through a **FusionFix-compatible file overlay system**. This allows modders to override game files by placing modified versions in specific folders, without needing to modify the base game files.

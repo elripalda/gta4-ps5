@@ -23,13 +23,14 @@ namespace rex::filesystem {
 
 HostPathDevice::HostPathDevice(const std::string_view mount_path,
                                const std::filesystem::path& host_path, bool read_only,
-                               bool allow_share_delete, bool trace_io)
+                               bool allow_share_delete, bool trace_io, bool eager_enumeration)
     : Device(mount_path),
       name_("STFS"),
       host_path_(host_path),
       read_only_(read_only),
       allow_share_delete_(allow_share_delete),
-      trace_io_(trace_io) {}
+      trace_io_(trace_io),
+      eager_enumeration_(eager_enumeration) {}
 
 HostPathDevice::~HostPathDevice() = default;
 
@@ -47,7 +48,9 @@ bool HostPathDevice::Initialize() {
   auto root_entry = new HostPathEntry(this, nullptr, "", host_path_);
   root_entry->attributes_ = kFileAttributeDirectory;
   root_entry_ = std::unique_ptr<Entry>(root_entry);
-  PopulateEntry(root_entry);
+  if (eager_enumeration_) {
+    PopulateEntry(root_entry);
+  }
 
   return true;
 }

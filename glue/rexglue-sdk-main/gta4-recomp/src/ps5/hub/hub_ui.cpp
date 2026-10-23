@@ -213,6 +213,11 @@ static const std::vector<Hub::Setting>& Settings() {
       {"GAME", "gta4_skip_intro", "Skip Intro", nullptr,
        "Goes straight to the game's start screen, past the logos and the legal screens.", false,
        {"false", "true"}, {"Off", "On"}, "false"},
+      {"GAME", "ps5_enable_mods", "Mods", nullptr,
+       "Loads the files in this app's mods/game folder when you start the game. Use Xbox 360 mods for "
+       "your game's episode and Title Update 8. Script menus need their own loader in the replacement "
+       "script archive. Turn Off and restart the app to play without mods.",
+       false, {"false", "true"}, {"Off", "On"}, "false"},
       // (the car camera's sideways offset: gta4_camera_hooks.cpp)
       {"GAME", "gta4_centered_vehicle_camera", "Centered Car Camera", nullptr,
        "Puts the camera straight behind the car instead of a little off to the side, like FusionFix's option "
