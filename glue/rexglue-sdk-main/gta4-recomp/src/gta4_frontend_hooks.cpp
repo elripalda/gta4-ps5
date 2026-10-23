@@ -1836,7 +1836,7 @@ bool g_start_episode_used = false;  // (the start only: later checks are the gam
 // save's name) to kStartEpisodeAddress. So with a TLAD save newest, GTA IV
 // chosen on Home still loaded TLAD. With a Home choice the scan here only
 // takes saves of that episode, and with none the episode starts new.
-constexpr uint32_t kProfilePointerAddress = 0x821E4DD4;
+constexpr uint32_t kProfilePointerAddress = 0x831E4DD4; // (lis -31970, lwz 19924: as sub_822440F8 reads it)
 constexpr uint32_t kBootSlotAddress = 0x82A95478;       // (-1: none, a new game)
 constexpr uint32_t kNewestSaveTimeAddress = 0x82BF98A0; // (6 words)
 constexpr uint32_t kSaveTableAddress = 0x82BF3D98;      // (XCONTENT_DATA, 308 bytes each)
