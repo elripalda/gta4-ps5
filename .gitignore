@@ -13,6 +13,7 @@ gta4/
 game/
 game
 gta_iv/
+!/glue/rexglue-sdk-main/gta4-recomp/src/ps5/game/
 
 # Embedded payload staging area (keep README only)
 tools/local_game_payload/*

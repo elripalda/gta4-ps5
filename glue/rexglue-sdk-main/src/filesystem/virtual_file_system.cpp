@@ -22,6 +22,20 @@ REXCVAR_DEFINE_BOOL(allow_game_relative_writes, false, "Filesystem",
 
 namespace rex::filesystem {
 
+namespace {
+
+bool MatchesSymbolicLink(std::string_view path, std::string_view link) {
+  if (link.empty() || !rex::string::utf8_starts_with_case(path, link)) {
+    return false;
+  }
+  // A file or directory link must end at a path component. Mount aliases and
+  // links ending in a separator already provide their own boundary.
+  return path.size() == link.size() || link.back() == ':' || link.back() == '\\' ||
+         path[link.size()] == '\\';
+}
+
+}  // namespace
+
 VirtualFileSystem::VirtualFileSystem() {}
 
 VirtualFileSystem::~VirtualFileSystem() {
@@ -75,7 +89,7 @@ bool VirtualFileSystem::UnregisterSymbolicLink(const std::string_view path) {
 bool VirtualFileSystem::FindSymbolicLink(const std::string_view path, std::string& target) {
   auto best = symlinks_.cend();
   for (auto it = symlinks_.cbegin(); it != symlinks_.cend(); ++it) {
-    if (rex::string::utf8_starts_with_case(path, it->first) &&
+    if (MatchesSymbolicLink(path, it->first) &&
         (best == symlinks_.cend() || it->first.size() > best->first.size())) {
       best = it;
     }
@@ -93,7 +107,7 @@ bool VirtualFileSystem::ResolveSymbolicLink(const std::string_view path, std::st
   while (true) {
     auto best = symlinks_.cend();
     for (auto it = symlinks_.cbegin(); it != symlinks_.cend(); ++it) {
-      if (rex::string::utf8_starts_with_case(result, it->first) &&
+      if (MatchesSymbolicLink(result, it->first) &&
           (best == symlinks_.cend() || it->first.size() > best->first.size())) {
         best = it;
       }
@@ -223,20 +237,21 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
   Entry* parent_entry = nullptr;
   Entry* entry = nullptr;
 
-  // Resolve absolute paths as a whole before splitting them into a parent and
-  // child. This preserves file-level symbolic links; resolving only the parent
-  // would bypass an override such as game:\xbox360.rpf.
-  if (!root_entry) {
-    entry = ResolvePath(path);
-    if (entry) {
-      parent_entry = entry->parent();
-    }
+  // Resolve the complete path before splitting it into a parent and child,
+  // including paths relative to an open directory. This preserves file-level
+  // symbolic links such as game:\xbox360.rpf and their device-path aliases.
+  entry = ResolvePath(root_entry ? rex::string::utf8_join_guest_paths(root_entry->absolute_path(), path)
+                                 : std::string(path));
+  if (entry) {
+    parent_entry = entry->parent();
   }
 
   if (!entry) {
     auto base_path = rex::string::utf8_find_base_guest_path(path);
     if (!base_path.empty()) {
-      parent_entry = !root_entry ? ResolvePath(base_path) : root_entry->ResolvePath(base_path);
+      parent_entry = ResolvePath(root_entry ? rex::string::utf8_join_guest_paths(
+                                                 root_entry->absolute_path(), base_path)
+                                           : base_path);
       if (!parent_entry) {
         *out_action = FileAction::kDoesNotExist;
         return X_STATUS_NO_SUCH_FILE;
@@ -245,7 +260,8 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
       auto file_name = rex::string::utf8_find_name_from_guest_path(path);
       entry = parent_entry->GetChild(file_name);
     } else {
-      entry = root_entry ? root_entry->GetChild(path) : nullptr;
+      parent_entry = root_entry;
+      entry = parent_entry ? parent_entry->GetChild(path) : nullptr;
     }
   }
 
@@ -299,6 +315,8 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
     desired_access = FileAccess::kGenericRead | FileAccess::kFileReadData;
   }
 
+  // Keep the resolved name before deleting an existing entry for replacement.
+  const auto file_name = entry ? entry->name() : rex::string::utf8_find_name_from_guest_path(path);
   bool created = false;
   if (!entry) {
     // Remember that we are creating this new, instead of replacing.
@@ -339,7 +357,10 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
   }
   if (!entry) {
     // Create if needed (either new or as a replacement).
-    entry = CreatePath(path, !is_directory ? kFileAttributeNormal : kFileAttributeDirectory);
+    const auto attributes = !is_directory ? kFileAttributeNormal : kFileAttributeDirectory;
+    // A directory-relative path cannot be walked from a mount alias by CreatePath.
+    entry = parent_entry ? parent_entry->CreateEntry(file_name, attributes)
+                         : CreatePath(path, attributes);
     if (!entry) {
       return X_STATUS_ACCESS_DENIED;
     }

@@ -470,6 +470,8 @@ elseif(PS5)
         src/ps5/game/trophies_game.cpp
         src/ps5/game/ps5_display.cpp
         src/ps5/game/ps5_overlay.cpp
+        src/ps5/game/mod_files.cpp
+        src/ps5/game/mod_loader.cpp
         src/ps5/game/save_import.cpp)
     # (the fonts are built into it: a changed one rebuilds it)
     file(GLOB GTA4_PS5_FONTS CONFIGURE_DEPENDS "${GTA4_PS5_DIR}/assets/fonts/*.ttf"

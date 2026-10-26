@@ -21,8 +21,10 @@ class HostPathEntry;
 
 class HostPathDevice : public Device {
  public:
+  // Disable eager enumeration for indexed overlays; ResolvePath still looks up files on demand.
   HostPathDevice(const std::string_view mount_path, const std::filesystem::path& host_path,
-                 bool read_only, bool allow_share_delete = false, bool trace_io = false);
+                 bool read_only, bool allow_share_delete = false, bool trace_io = false,
+                 bool eager_enumeration = true);
   ~HostPathDevice() override;
 
   bool Initialize() override;
@@ -56,6 +58,7 @@ class HostPathDevice : public Device {
   bool read_only_;
   bool allow_share_delete_;
   bool trace_io_;
+  bool eager_enumeration_;
 };
 
 }  // namespace rex::filesystem

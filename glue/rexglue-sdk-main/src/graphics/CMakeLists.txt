@@ -242,7 +242,9 @@ if(REXGLUE_USE_VULKAN)
             endif()
         endif()
     elseif(CMAKE_HOST_UNIX AND GTA4_NATIVE_DXC_ARCH STREQUAL "x64")
-        set(GTA4_NATIVE_DXC "${GTA4_NATIVE_DXC_ROOT}/bin/x64/dxc-linux")
+        if(NOT GTA4_NATIVE_DXC)
+            set(GTA4_NATIVE_DXC "${GTA4_NATIVE_DXC_ROOT}/bin/x64/dxc-linux")
+        endif()
         if(NOT GTA4_NATIVE_DXC_LIBRARY_PATH)
             set(GTA4_NATIVE_DXC_LIBRARY_PATH "${GTA4_NATIVE_DXC_ROOT}/lib/x64")
         endif()
@@ -334,9 +336,11 @@ if(REXGLUE_USE_VULKAN)
         "${GTA4_NATIVE_SHADER_CACHE_ROOT}"
         "${GTA4_NATIVE_SMOLV_ROOT}"
     )
-    target_compile_definitions(rexgpu-gta4-native PRIVATE
-        GTA4_NATIVE_FONT_ASSET_ROOT="${LIBERTY_RECOMP_WORKSPACE_ROOT}/LibertyRecompLib/font_atlases"
-    )
+    if(NOT PS5)
+        target_compile_definitions(rexgpu-gta4-native PRIVATE
+            GTA4_NATIVE_FONT_ASSET_ROOT="${LIBERTY_RECOMP_WORKSPACE_ROOT}/LibertyRecompLib/font_atlases"
+        )
+    endif()
     target_link_libraries(rexgpu-gta4-native PRIVATE
         libzstd_static
         SPIRV-Headers::SPIRV-Headers

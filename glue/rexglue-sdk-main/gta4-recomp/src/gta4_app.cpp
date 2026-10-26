@@ -1,6 +1,7 @@
 #include "gta4_app.h"
 #if REX_PLATFORM_PS5
 #include "ps5/gta4_ps5_app.h"
+#include "ps5/game/mod_loader.h"
 #endif
 #include "gta4_hack_registry.h"
 #include "gta4_present_mode_policy.h"
@@ -1133,6 +1134,9 @@ void GTA4App::OnPostSetup() {
   }
   LogEpisodeInstallState(runtime()->marketplace_content_root());
   gta4::button_prompts::PrepareAndMount(*runtime(), game_data_root(), cache_root());
+#if REX_PLATFORM_PS5
+  gta4ps5::MountMods(*runtime(), "/app0");
+#endif
 
   achievement_service_ = live && live->config().backend == rex::system::xam::LiveBackend::kCommunity
                              ? live->achievement_service()

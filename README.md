@@ -73,6 +73,18 @@ To update, copy the new `PPSA94004` folder over the old one. The installed game,
 ## Xbox 360 saves
 Copy your saves off the 360 (`Content/<your profile>/545407F2/00000001/`) into `/data/homebrew/PPSA94004/import/`, then pick Import on the hub's Saves page.
 
+## Mods and script menus
+
+Enable **Game → Mods** in the hub to load replacement files from
+`/data/homebrew/PPSA94004/mods/game/`. Mirror each file's path under the installed
+`UserData/LibertyRecomp/game/` folder. Quit and restart the app after changing files.
+Turn Mods off and restart to return to the original game.
+
+Xbox 360 script-menu archive packs with their own loader/bootstrap are the
+initial target; individual menus still need testing on PS5. Loose `.sco` files
+do not start automatically, and PC `.asi` plugins and ScriptHook DLLs cannot
+run here. See [PS5 mod setup and limitations](docs/MOD_SUPPORT.md#ps5-port).
+
 ## The hub
 | Button | Does |
 |---|---|
