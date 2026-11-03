@@ -1,0 +1,1861 @@
+diff --git a/.github/workflows/build-ps4-pro.yml b/.github/workflows/build-ps4-pro.yml
+new file mode 100644
+index 0000000..e64d59a
+--- /dev/null
++++ b/.github/workflows/build-ps4-pro.yml
+@@ -0,0 +1,122 @@
++name: Build PS4 Pro (OpenOrbis / Neo / 1080p)
++
++# This workflow assumes the ps4-pro.patch from this change set is committed.
++# It builds eboot.bin + sce_sys/param.sfo WITHOUT the 7 GB Xbox 360 payload.
++"on":
++  workflow_dispatch:
++    inputs:
++      neo_mode:
++        description: "PS4 Pro / Neo memory mode (ATTRIBUTE bit 23, 5 GiB direct memory)"
++        type: boolean
++        default: true
++      skip_game_payload:
++        description: "Build without embedding the game files"
++        type: boolean
++        default: true
++      ps4_game_root:
++        description: "Runtime directory with default.xex + *.rpf on the console"
++        type: string
++        default: "/data/gta4"
++  push:
++    paths:
++      - ".github/workflows/build-ps4-pro.yml"
++      - "CMakePresets.json"
++      - "toolchains/ps4-openorbis.cmake"
++      - "tools/ps4/sfo_neo.py"
++  pull_request:
++    paths:
++      - ".github/workflows/build-ps4-pro.yml"
++
++jobs:
++  build:
++    runs-on: ubuntu-24.04
++    timeout-minutes: 120
++    env:
++      OO_PS4_TOOLCHAIN: ${{ github.workspace }}/tools/OpenOrbis-PS4-Toolchain
++    steps:
++      - name: Checkout (no submodules, no game files)
++        uses: actions/checkout@v4
++        with:
++          fetch-depth: 1
++          submodules: false
++
++      - name: Host toolchain (clang/lld/ninja/CMake >= 3.29)
++        run: |
++          sudo apt-get update
++          sudo apt-get install -y --no-install-recommends \
++            clang lld llvm ninja-build python3 python3-pip git unzip wget ca-certificates
++          python3 -m pip install --user --upgrade "cmake==3.31.6"
++          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
++          cmake --version
++          clang --version | head -1
++          ninja --version
++
++      - name: OpenOrbis PS4 toolchain (headers, link.x, CRT, create-fself)
++        run: |
++          set -euo pipefail
++          rm -rf tools/OpenOrbis-PS4-Toolchain
++          git clone --depth 1 \
++            https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain.git \
++            tools/OpenOrbis-PS4-Toolchain
++          # The repo itself has no prebuilt host binaries in bin/linux/ and no
++          # make_param_sfo.py. Release v0.5.3 ships create-fself, create-gp4,
++          # PkgTool.Core, include/orbis, link.x and lib/crt1.o.
++          wget -q -O /tmp/oo.zip \
++            https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.3/toolchain-llvm-18.2.zip
++          unzip -q -o /tmp/oo.zip -d /tmp/oo
++          mkdir -p /tmp/oo/extracted
++          tar -xzf /tmp/oo/toolchain-llvm-18.tar.gz -C /tmp/oo/extracted \
++            --strip-components=2
++          cp -a /tmp/oo/extracted/. tools/OpenOrbis-PS4-Toolchain/
++          chmod +x tools/OpenOrbis-PS4-Toolchain/bin/linux/create-fself \
++                 tools/OpenOrbis-PS4-Toolchain/bin/linux/create-gp4 \
++                 tools/OpenOrbis-PS4-Toolchain/bin/linux/PkgTool.Core 2>/dev/null || true
++          test -x tools/OpenOrbis-PS4-Toolchain/bin/linux/create-fself
++          test -f tools/OpenOrbis-PS4-Toolchain/link.x
++          # toolchains/ps4-openorbis.cmake generates orbis-ld in the build
++          # tree; keep a copy in the SDK tree as well for older CMake runs.
++          mkdir -p tools/OpenOrbis-PS4-Toolchain/bin
++          printf '#!/bin/sh\nexec ld.lld "$@"\n' > tools/OpenOrbis-PS4-Toolchain/bin/orbis-ld
++          chmod +x tools/OpenOrbis-PS4-Toolchain/bin/orbis-ld
++
++      - name: Fetch third-party submodules (setup.sh, no game data)
++        run: ./setup.sh
++
++      - name: Configure (ps4-pro-release)
++        run: |
++          cmake --preset ps4-pro-release \
++            -DLIBERTY_RECOMP_SKIP_GAME_PAYLOAD=${{ inputs.skip_game_payload == false && 'OFF' || 'ON' }} \
++            -DLIBERTY_PS4_NEO_MODE=${{ inputs.neo_mode == false && 'OFF' || 'ON' }} \
++            -DLIBERTY_PS4_GAME_ROOT="${{ inputs.ps4_game_root || '/data/gta4' }}" \
++            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
++
++      - name: Build eboot.bin
++        run: cmake --build out/build/ps4-pro-release --target LibertyRecomp -j 2
++
++      - name: Build sce_sys/param.sfo (Neo ATTRIBUTE bit 23)
++        run: |
++          cmake --build out/build/ps4-pro-release --target LibertyRecomp-sfo -j 2
++          python3 tools/ps4/sfo_neo.py inspect \
++            out/build/ps4-pro-release/pkg_staging/sce_sys/param.sfo
++
++      - name: Optional PKG (requires create-gp4 + PkgTool.Core)
++        continue-on-error: true
++        run: cmake --build out/build/ps4-pro-release --target LibertyRecomp-pkg -j 2
++
++      - name: Collect artefacts
++        run: |
++          set -euo pipefail
++          mkdir -p artefacts/sce_sys
++          cp out/build/ps4-pro-release/LibertyRecomp/eboot.bin artefacts/ 2>/dev/null || \
++            find out/build/ps4-pro-release -name eboot.bin -exec cp {} artefacts/ \; -quit
++          cp out/build/ps4-pro-release/pkg_staging/sce_sys/param.sfo artefacts/sce_sys/
++          ls -lh artefacts artefacts/sce_sys
++          test -s artefacts/eboot.bin
++          test -s artefacts/sce_sys/param.sfo
++
++      - name: Upload eboot.bin + param.sfo
++        uses: actions/upload-artifact@v4
++        with:
++          name: gta4-ps4-pro-eboot
++          path: artefacts/
++          if-no-files-found: error
+diff --git a/.gitignore b/.gitignore
+index bade572..a212371 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -794,3 +794,7 @@ CMakeUserPresets.json
+ !/tools/tests/test_metal_shader_archive.py
+ !/tools/vulkan/*.py
+ !/glue/rexglue-sdk-main/cmake/fidelityfx_shader_compiler.py
++
++# [ps4 pro] PS4 Pro CI workflow and SFO helper must be committed.
++!/.github/workflows/build-ps4-pro.yml
++!/tools/ps4/sfo_neo.py
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0bc4dad..5471498 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -98,10 +98,33 @@ option(LIBERTY_RECOMP_ANDROID_RUNTIME_ASSETS
+     "Android: expect the game payload to be supplied at runtime (skip CMake-time validation)"
+     OFF)
+ 
++# [ps4 pro] Compile eboot.bin / param.sfo WITHOUT the ~7 GB extracted Xbox 360
++# disc payload. Empty zero-byte stubs are created in the build tree; the real
++# game files are supplied on the console at runtime (see
++# LibertyRecomp/install/ps4_game_root.h). Default OFF keeps every other target
++# (desktop, Android, iOS, Switch, PS5) completely unchanged.
++option(LIBERTY_RECOMP_SKIP_GAME_PAYLOAD
++    "Build without the extracted Xbox 360 game payload (create empty build-tree stubs)" OFF)
++
+ if(NOT LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "desktop")
+     message(STATUS "Embedded game path: ${LIBERTY_RECOMP_EMBEDDED_GAME_PATH}")
+ 
+-    if(LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "android" AND LIBERTY_RECOMP_ANDROID_RUNTIME_ASSETS)
++    if(LIBERTY_RECOMP_SKIP_GAME_PAYLOAD)
++        # [ps4 pro] No FATAL_ERROR and no 7 GB upload: stage empty stubs in the
++        # build directory and point every downstream consumer at them.
++        set(_ps4_stub_root "${CMAKE_BINARY_DIR}/ps4_empty_game_payload")
++        file(MAKE_DIRECTORY "${_ps4_stub_root}")
++        foreach(_req_file default.xex common.rpf xbox360.rpf audio.rpf)
++            if(NOT EXISTS "${_ps4_stub_root}/${_req_file}")
++                file(WRITE "${_ps4_stub_root}/${_req_file}" "")
++            endif()
++        endforeach()
++        set(LIBERTY_RECOMP_EMBEDDED_GAME_PATH "${_ps4_stub_root}" CACHE PATH "" FORCE)
++        message(STATUS
++            "PS4 Pro: LIBERTY_RECOMP_SKIP_GAME_PAYLOAD=ON — empty payload stubs at ${_ps4_stub_root}.\n"
++            "         Set LIBERTY_PS4_GAME_ROOT (CMake) or the LIBERTY_PS4_GAME_ROOT env var\n"
++            "         on the console to the directory holding the real game files.")
++    elseif(LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "android" AND LIBERTY_RECOMP_ANDROID_RUNTIME_ASSETS)
+         message(STATUS
+             "Android: LIBERTY_RECOMP_ANDROID_RUNTIME_ASSETS=ON — skipping build-time\n"
+             "         game-file validation. The Activity's folder-picker flow is\n"
+@@ -171,8 +194,9 @@ endif()
+ string(TOLOWER "${LIBERTY_RECOMP_ARCHITECTURE}" LIBERTY_RECOMP_ARCHITECTURE)
+ message(STATUS "Detected architecture: ${LIBERTY_RECOMP_ARCHITECTURE}")
+ 
+-if (LIBERTY_RECOMP_ARCHITECTURE STREQUAL "x86_64" OR LIBERTY_RECOMP_ARCHITECTURE STREQUAL "amd64")
+-    # Target Sandy Bridge for all projects
++if (NOT PS4 AND (LIBERTY_RECOMP_ARCHITECTURE STREQUAL "x86_64" OR LIBERTY_RECOMP_ARCHITECTURE STREQUAL "amd64"))
++    # Target Sandy Bridge for all projects (PS4 Pro uses Jaguar: -march=btver2
++    # is supplied by toolchains/ps4-openorbis.cmake).
+     add_compile_options(
+         -march=sandybridge
+     )
+diff --git a/CMakePresets.json b/CMakePresets.json
+index 2f2e056..7bc1d54 100644
+--- a/CMakePresets.json
++++ b/CMakePresets.json
+@@ -375,6 +375,46 @@
+                 "CMAKE_BUILD_TYPE": "Release"
+             }
+         },
++        {
++            "name": "ps4-pro-release",
++            "displayName": "PS4 Pro Release (1080p / Neo)",
++            "inherits": "ps4-base",
++            "cacheVariables": {
++                "CMAKE_BUILD_TYPE": "Release",
++                "LIBERTY_RECOMP_SKIP_GAME_PAYLOAD": {
++                    "value": "ON",
++                    "type": "BOOL"
++                },
++                "LIBERTY_PS4_NEO_MODE": {
++                    "value": "ON",
++                    "type": "BOOL"
++                },
++                "LIBERTY_PS4_OUTPUT_WIDTH": {
++                    "value": "1920",
++                    "type": "STRING"
++                },
++                "LIBERTY_PS4_OUTPUT_HEIGHT": {
++                    "value": "1080",
++                    "type": "STRING"
++                },
++                "LIBERTY_RECOMP_VULKAN": {
++                    "value": "OFF",
++                    "type": "BOOL"
++                },
++                "LIBERTY_RECOMP_GNM": {
++                    "value": "ON",
++                    "type": "BOOL"
++                },
++                "REXGLUE_ENABLE_FIDELITYFX": {
++                    "value": "OFF",
++                    "type": "BOOL"
++                },
++                "REXGLUE_ENABLE_TRACY": {
++                    "value": "OFF",
++                    "type": "BOOL"
++                }
++            }
++        },
+         {
+             "name": "switch-base",
+             "hidden": true,
+@@ -539,6 +579,10 @@
+             "name": "ps4-release",
+             "configurePreset": "ps4-release"
+         },
++        {
++            "name": "ps4-pro-release",
++            "configurePreset": "ps4-pro-release"
++        },
+         {
+             "name": "switch-debug",
+             "configurePreset": "switch-debug"
+diff --git a/LibertyRecomp/CMakeLists.txt b/LibertyRecomp/CMakeLists.txt
+index 26b9595..c925bee 100644
+--- a/LibertyRecomp/CMakeLists.txt
++++ b/LibertyRecomp/CMakeLists.txt
+@@ -1,5 +1,13 @@
+ project("LibertyRecomp")
+ 
++# [ps4 pro] PS4 Pro / Neo mode and the runtime game-root override.
++if (CMAKE_SYSTEM_NAME STREQUAL "PS4" OR LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "ps4")
++    option(LIBERTY_PS4_NEO_MODE
++        "Enable PS4 Pro (Neo) memory mode: param.sfo ATTRIBUTE bit 23 + 5 GiB direct memory" ON)
++    set(LIBERTY_PS4_GAME_ROOT "/app0/game" CACHE PATH
++        "Default runtime directory with default.xex + *.rpf (env LIBERTY_PS4_GAME_ROOT overrides)")
++endif()
++
+ # ── zlib: system library on desktop, built from source for console cross-compilation ──
+ if (CMAKE_SYSTEM_NAME STREQUAL "PS4" OR CMAKE_SYSTEM_NAME STREQUAL "Switch")
+     include(FetchContent)
+@@ -127,6 +135,9 @@ add_compile_definitions(
+ if (LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "ps4" OR CMAKE_SYSTEM_NAME STREQUAL "PS4")
+     set(LIBERTY_RECOMP_PS4 TRUE)
+     add_compile_definitions(LIBERTY_RECOMP_PS4)
++    # [ps4 pro] Used by install/ps4_game_root.h so the real game files can
++    # live outside the read-only /app0 PKG mount (e.g. /data/gta4/).
++    add_compile_definitions("LIBERTY_PS4_GAME_ROOT_DEFAULT=\"${LIBERTY_PS4_GAME_ROOT}\"")
+ endif()
+ if (LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "switch" OR CMAKE_SYSTEM_NAME STREQUAL "Switch")
+     # CMake variable retained for conditional source lists / link targets below.
+@@ -994,6 +1005,28 @@ else()
+         set(LIBERTY_PS4_TITLE_STR   "Grand Theft Auto IV")
+         set(LIBERTY_PS4_CATEGORY    "gd")  # gd = game data
+ 
++        # [ps4 pro] ATTRIBUTE bit 23 (1 << 23 = 0x800000 = 8388608) is the
++        # PS4 Pro / Neo flag. Without it sceKernelIsNeoMode() stays 0 and the
++        # kernel only exposes the base 4.5 GiB of direct memory.
++        set(LIBERTY_PS4_ATTRIBUTE_VALUE 0)
++        if (LIBERTY_PS4_NEO_MODE)
++            math(EXPR LIBERTY_PS4_ATTRIBUTE_VALUE "1 << 23")
++        endif()
++        set(LIBERTY_PS4_SFO_HELPER
++            "${CMAKE_CURRENT_SOURCE_DIR}/../tools/ps4/sfo_neo.py")
++        message(STATUS "PS4: param.sfo ATTRIBUTE = ${LIBERTY_PS4_ATTRIBUTE_VALUE} (Neo=${LIBERTY_PS4_NEO_MODE})")
++
++        # [ps4 pro] Skip copying the 7 GB payload into the PKG when the
++        # build is payload-free; the console reads the files at runtime.
++        if (LIBERTY_RECOMP_SKIP_GAME_PAYLOAD)
++            set(_ps4_copy_game_payload "")
++        else()
++            set(_ps4_copy_game_payload
++                COMMAND ${CMAKE_COMMAND} -E copy_directory
++                    "${LIBERTY_RECOMP_EMBEDDED_GAME_PATH}"
++                    "${LIBERTY_PS4_PKG_STAGING}/game")
++        endif()
++
+         message(STATUS "PS4: TITLE_ID=${LIBERTY_PS4_TITLE_ID}  CONTENT_ID=${LIBERTY_PS4_CONTENT_ID}")
+ 
+         # Detect host OS for toolchain bin subdir.
+@@ -1110,7 +1143,12 @@ else()
+                     "${LIBERTY_PS4_CONTENT_ID}"
+                     "${LIBERTY_PS4_TITLE_STR}"
+                     "${LIBERTY_PS4_VERSION}"
+-                COMMENT "PS4: Generating sce_sys/param.sfo (make_param_sfo.py)"
++                COMMAND ${Python3_EXECUTABLE} "${LIBERTY_PS4_SFO_HELPER}" patch
++                    "${LIBERTY_PS4_PARAM_SFO}" --attribute ${LIBERTY_PS4_ATTRIBUTE_VALUE}
++                    --title-id "${LIBERTY_PS4_TITLE_ID}" --content-id "${LIBERTY_PS4_CONTENT_ID}"
++                    --title "${LIBERTY_PS4_TITLE_STR}" --version "${LIBERTY_PS4_VERSION}"
++                    --category "${LIBERTY_PS4_CATEGORY}"
++                COMMENT "PS4: Generating sce_sys/param.sfo (make_param_sfo.py + Neo bit)"
+                 VERBATIM
+             )
+         elseif (LIBERTY_PS4_PKGTOOL)
+@@ -1121,7 +1159,7 @@ else()
+                 COMMAND "${LIBERTY_PS4_PKGTOOL}" sfo_new             "${LIBERTY_PS4_PARAM_SFO}"
+                 COMMAND "${LIBERTY_PS4_PKGTOOL}" sfo_setentry "${LIBERTY_PS4_PARAM_SFO}" APP_TYPE           --type Integer --maxsize 4   --value 1
+                 COMMAND "${LIBERTY_PS4_PKGTOOL}" sfo_setentry "${LIBERTY_PS4_PARAM_SFO}" APP_VER            --type Utf8    --maxsize 8   --value "${LIBERTY_PS4_VERSION}"
+-                COMMAND "${LIBERTY_PS4_PKGTOOL}" sfo_setentry "${LIBERTY_PS4_PARAM_SFO}" ATTRIBUTE          --type Integer --maxsize 4   --value 0
++                COMMAND "${LIBERTY_PS4_PKGTOOL}" sfo_setentry "${LIBERTY_PS4_PARAM_SFO}" ATTRIBUTE          --type Integer --maxsize 4   --value ${LIBERTY_PS4_ATTRIBUTE_VALUE}
+                 COMMAND "${LIBERTY_PS4_PKGTOOL}" sfo_setentry "${LIBERTY_PS4_PARAM_SFO}" CATEGORY           --type Utf8    --maxsize 4   --value "${LIBERTY_PS4_CATEGORY}"
+                 COMMAND "${LIBERTY_PS4_PKGTOOL}" sfo_setentry "${LIBERTY_PS4_PARAM_SFO}" CONTENT_ID         --type Utf8    --maxsize 48  --value "${LIBERTY_PS4_CONTENT_ID}"
+                 COMMAND "${LIBERTY_PS4_PKGTOOL}" sfo_setentry "${LIBERTY_PS4_PARAM_SFO}" DOWNLOAD_DATA_SIZE --type Integer --maxsize 4   --value 0
+@@ -1129,20 +1167,30 @@ else()
+                 COMMAND "${LIBERTY_PS4_PKGTOOL}" sfo_setentry "${LIBERTY_PS4_PARAM_SFO}" TITLE              --type Utf8    --maxsize 128 --value "${LIBERTY_PS4_TITLE_STR}"
+                 COMMAND "${LIBERTY_PS4_PKGTOOL}" sfo_setentry "${LIBERTY_PS4_PARAM_SFO}" TITLE_ID           --type Utf8    --maxsize 12  --value "${LIBERTY_PS4_TITLE_ID}"
+                 COMMAND "${LIBERTY_PS4_PKGTOOL}" sfo_setentry "${LIBERTY_PS4_PARAM_SFO}" VERSION            --type Utf8    --maxsize 8   --value "${LIBERTY_PS4_VERSION}"
+-                COMMENT "PS4: Generating sce_sys/param.sfo (PkgTool.Core)"
++                COMMAND ${Python3_EXECUTABLE} "${LIBERTY_PS4_SFO_HELPER}" patch
++                    "${LIBERTY_PS4_PARAM_SFO}" --attribute ${LIBERTY_PS4_ATTRIBUTE_VALUE}
++                    --title-id "${LIBERTY_PS4_TITLE_ID}" --content-id "${LIBERTY_PS4_CONTENT_ID}"
++                    --title "${LIBERTY_PS4_TITLE_STR}" --version "${LIBERTY_PS4_VERSION}"
++                    --category "${LIBERTY_PS4_CATEGORY}"
++                COMMENT "PS4: Generating sce_sys/param.sfo (PkgTool.Core + Neo bit)"
+                 VERBATIM
+             )
+         else()
+-            message(WARNING
+-                "PS4: Neither make_param_sfo.py nor PkgTool.Core is available — "
+-                "param.sfo generation will be a placeholder. Install Python 3 "
+-                "or the OpenOrbis toolchain to produce a real SFO.")
++            # [ps4 pro] Stock OpenOrbis has no make_param_sfo.py and no
++            # PkgTool.Core binary in the repo checkout. Generate a real SFO
++            # (including the Neo ATTRIBUTE bit) with our own helper instead of
++            # writing a useless placeholder file.
++            find_package(Python3 COMPONENTS Interpreter QUIET)
+             add_custom_command(
+                 OUTPUT  "${LIBERTY_PS4_PARAM_SFO}"
+                 COMMAND ${CMAKE_COMMAND} -E make_directory "${LIBERTY_PS4_SCE_SYS_DIR}"
+-                COMMAND ${CMAKE_COMMAND} -E echo "TODO: generate param.sfo TITLE_ID=${LIBERTY_PS4_TITLE_ID} CONTENT_ID=${LIBERTY_PS4_CONTENT_ID}"
+-                COMMAND ${CMAKE_COMMAND} -E touch "${LIBERTY_PS4_PARAM_SFO}"
+-                COMMENT "PS4: param.sfo placeholder (no generator found)"
++                COMMAND ${Python3_EXECUTABLE} "${LIBERTY_PS4_SFO_HELPER}" create
++                    "${LIBERTY_PS4_PARAM_SFO}" --attribute ${LIBERTY_PS4_ATTRIBUTE_VALUE}
++                    --title-id "${LIBERTY_PS4_TITLE_ID}" --content-id "${LIBERTY_PS4_CONTENT_ID}"
++                    --title "${LIBERTY_PS4_TITLE_STR}" --version "${LIBERTY_PS4_VERSION}"
++                    --category "${LIBERTY_PS4_CATEGORY}"
++                COMMENT "PS4: Generating sce_sys/param.sfo (sfo_neo.py, Neo=${LIBERTY_PS4_NEO_MODE})"
++                VERBATIM
+             )
+         endif()
+ 
+@@ -1302,9 +1350,7 @@ else()
+                 COMMAND ${CMAKE_COMMAND} -E copy
+                     "$<TARGET_FILE_DIR:LibertyRecomp>/eboot.bin"
+                     "${LIBERTY_PS4_PKG_STAGING}/eboot.bin"
+-                COMMAND ${CMAKE_COMMAND} -E copy_directory
+-                    "${LIBERTY_RECOMP_EMBEDDED_GAME_PATH}"
+-                    "${LIBERTY_PS4_PKG_STAGING}/game"
++                ${_ps4_copy_game_payload}
+ 
+                 # Bake the PS4 button-prompt XTD into the read-only /app0
+                 # tree. On PS4 we can't write to the PKG mount at runtime,
+@@ -1384,9 +1430,7 @@ else()
+                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                     "${CMAKE_CURRENT_SOURCE_DIR}/res/ps4/sce_sys/snd0.wav"
+                     "${LIBERTY_PS4_SCE_SYS_DIR}/snd0.wav"
+-                COMMAND ${CMAKE_COMMAND} -E copy_directory
+-                    "${LIBERTY_RECOMP_EMBEDDED_GAME_PATH}"
+-                    "${LIBERTY_PS4_PKG_STAGING}/game"
++                ${_ps4_copy_game_payload}
+                 COMMENT "PS4: Basic file staging only (.pkg tools not found)."
+             )
+         endif()
+@@ -1432,22 +1476,29 @@ endif()
+ # picks the game folder at runtime via the SAF folder picker, so there is no
+ # build-time payload to validate.
+ if (LIBERTY_RECOMP_EMBEDDED_ASSETS AND NOT LIBERTY_RECOMP_ANDROID_RUNTIME_ASSETS)
+-    if (NOT LIBERTY_RECOMP_EMBEDDED_GAME_PATH)
+-        message(FATAL_ERROR
+-            "LIBERTY_RECOMP_EMBEDDED_ASSETS is ON but "
+-            "LIBERTY_RECOMP_EMBEDDED_GAME_PATH is not set.\n"
+-            "Point it at the directory containing default.xex, common.rpf, "
+-            "xbox360.rpf and audio.rpf.")
+-    endif()
+-    foreach(_required_file default.xex common.rpf xbox360.rpf audio.rpf)
+-        if (NOT EXISTS "${LIBERTY_RECOMP_EMBEDDED_GAME_PATH}/${_required_file}")
++    # [ps4 pro] With LIBERTY_RECOMP_SKIP_GAME_PAYLOAD=ON the root CMakeLists
++    # generated empty stubs; do not FATAL_ERROR on them. The real files are
++    # provided on the console at runtime.
++    if (NOT LIBERTY_RECOMP_SKIP_GAME_PAYLOAD)
++        if (NOT LIBERTY_RECOMP_EMBEDDED_GAME_PATH)
+             message(FATAL_ERROR
+-                "Required game file missing from payload: "
+-                "${LIBERTY_RECOMP_EMBEDDED_GAME_PATH}/${_required_file}\n"
+-                "See docs/PLATFORM_SETUP.md#build-time-asset-payload")
++                "LIBERTY_RECOMP_EMBEDDED_ASSETS is ON but "
++                "LIBERTY_RECOMP_EMBEDDED_GAME_PATH is not set.\n"
++                "Point it at the directory containing default.xex, common.rpf, "
++                "xbox360.rpf and audio.rpf.")
+         endif()
+-    endforeach()
+-    message(STATUS "Embedded payload validated: ${LIBERTY_RECOMP_EMBEDDED_GAME_PATH}")
++        foreach(_required_file default.xex common.rpf xbox360.rpf audio.rpf)
++            if (NOT EXISTS "${LIBERTY_RECOMP_EMBEDDED_GAME_PATH}/${_required_file}")
++                message(FATAL_ERROR
++                    "Required game file missing from payload: "
++                    "${LIBERTY_RECOMP_EMBEDDED_GAME_PATH}/${_required_file}\n"
++                    "See docs/PLATFORM_SETUP.md#build-time-asset-payload")
++            endif()
++        endforeach()
++        message(STATUS "Embedded payload validated: ${LIBERTY_RECOMP_EMBEDDED_GAME_PATH}")
++    else()
++        message(STATUS "PS4 Pro: embedded payload validation skipped (empty stubs).")
++    endif()
+ 
+     # Generate manifest.json so EmbeddedAssets::ReadManifest() works at runtime.
+     string(TIMESTAMP _build_ts "%s" UTC)
+diff --git a/LibertyRecomp/install/embedded_assets.cpp b/LibertyRecomp/install/embedded_assets.cpp
+index b8e2114..1bf2ba1 100644
+--- a/LibertyRecomp/install/embedded_assets.cpp
++++ b/LibertyRecomp/install/embedded_assets.cpp
+@@ -1,5 +1,6 @@
+ #include "embedded_assets.h"
+ #include "platform_paths.h"
++#include "ps4_game_root.h"
+ 
+ #include <fstream>
+ #include <filesystem>
+@@ -105,7 +106,9 @@ static bool extract_and_fsync(mz_zip_archive* zip, mz_uint idx,
+ static std::filesystem::path ResolveEmbeddedGameRoot()
+ {
+ #if defined(__ORBIS__)
+-    return std::filesystem::path("/app0/game");
++    // [ps4 pro] Allow an external game directory (e.g. /data/gta4/) instead of
++    // the read-only /app0/game inside the PKG.
++    return liberty::ps4::GameRoot();
+ #elif defined(__SWITCH__)
+     return std::filesystem::path("romfs:/game");
+ #elif REX_PLATFORM_IOS
+diff --git a/LibertyRecomp/install/platform_paths.cpp b/LibertyRecomp/install/platform_paths.cpp
+index b0beb16..406eb24 100644
+--- a/LibertyRecomp/install/platform_paths.cpp
++++ b/LibertyRecomp/install/platform_paths.cpp
+@@ -1,4 +1,5 @@
+ #include "platform_paths.h"
++#include "ps4_game_root.h"
+ 
+ #include <rex/platform.h>
+ #include <cstdlib>
+@@ -118,7 +119,8 @@ namespace PlatformPaths
+         // /app0/game. Any writes to this path silently fail. Callers that
+         // need to write (e.g. runtime-generated button-prompt cache files)
+         // must use GetWritableCacheDirectory() instead.
+-        return std::filesystem::path("/app0/game");
++        // [ps4 pro] Same override as EmbeddedAssets::GetGameRoot().
++        return liberty::ps4::GameRoot();
+ #else
+         return GetInstallDirectory() / "game";
+ #endif
+diff --git a/LibertyRecomp/install/ps4_game_root.h b/LibertyRecomp/install/ps4_game_root.h
+new file mode 100644
+index 0000000..6139b79
+--- /dev/null
++++ b/LibertyRecomp/install/ps4_game_root.h
+@@ -0,0 +1,27 @@
++#pragma once
++// [ps4 pro] Where the PS4 build looks for the Xbox 360 game files at runtime.
++//
++// Historically the PKG shipped them at /app0/game (read-only). To build a
++// small eboot.bin without uploading 7 GB of assets, the real files can be
++// placed anywhere the homebrew process can read, e.g. /data/gta4/ on a
++// jailbroken console, and selected with the LIBERTY_PS4_GAME_ROOT environment
++// variable or by setting the CMake cache variable of the same name.
++
++#include <filesystem>
++#include <cstdlib>
++
++#if defined(__ORBIS__)
++
++#ifndef LIBERTY_PS4_GAME_ROOT_DEFAULT
++#define LIBERTY_PS4_GAME_ROOT_DEFAULT "/app0/game"
++#endif
++
++namespace liberty::ps4 {
++inline std::filesystem::path GameRoot() {
++    if (const char* env = std::getenv("LIBERTY_PS4_GAME_ROOT")) {
++        if (env[0] != '\0') return std::filesystem::path(env);
++    }
++    return std::filesystem::path(LIBERTY_PS4_GAME_ROOT_DEFAULT);
++}
++}  // namespace liberty::ps4
++#endif  // __ORBIS__
+diff --git a/LibertyRecomp/os/ps4/user_malloc_ps4.cpp b/LibertyRecomp/os/ps4/user_malloc_ps4.cpp
+index 0722c3f..6f9ef3c 100644
+--- a/LibertyRecomp/os/ps4/user_malloc_ps4.cpp
++++ b/LibertyRecomp/os/ps4/user_malloc_ps4.cpp
+@@ -3,7 +3,7 @@
+ // Modeled on Minecraft PS4's user_malloc.cpp (Sony SDK reference).
+ // Must be called before ANY other allocation — do it first in ps4_main.cpp.
+ //
+-// Memory layout (total: 4.6 GB dmem)
++// Memory layout (base PS4: 4.5 GiB dmem; PS4 Pro / Neo: 5 GiB dmem)
+ //   Heap (mspace)   ~3.954 GB   — everything below
+ //   GPU VRAM        512 MB      — reserved by renderer at init
+ //   CPU gfx buffers 112 MB      — reserved by renderer at init
+@@ -27,7 +27,25 @@ static size_t        s_memLength = 0;
+ 
+ static constexpr size_t MB            = 1024ULL * 1024ULL;
+ static constexpr size_t MEM_ALIGN     = 2 * MB;   // 2 MB — match dmem granularity
+-static constexpr size_t HEAP_TOTAL    = 4608 * MB; // PS4 main dmem ceiling
++// [ps4 pro] Base PS4 direct memory is 4.5 GiB (4608 MiB). With Neo/Pro mode
++// enabled (param.sfo ATTRIBUTE bit 23) the kernel grants +512 MiB, i.e. 5 GiB
++// of direct memory; sceKernelIsNeoMode() decides which ceiling is real.
++static constexpr size_t HEAP_TOTAL_BASE = 4608 * MB;
++static constexpr size_t HEAP_TOTAL_NEO  = 5120 * MB;
++
++// sceKernelIsNeoMode() / sceKernelGetDirectMemorySize() are declared by
++// <orbis/libkernel.h> above.
++
++static size_t Ps4DirectMemoryCeiling()
++{
++    const size_t reported = sceKernelGetDirectMemorySize();
++    const bool   neo      = sceKernelIsNeoMode() != 0;
++    size_t       ceiling  = neo ? HEAP_TOTAL_NEO : HEAP_TOTAL_BASE;
++    // Never ask for more than the kernel actually reports.
++    if (reported != 0 && reported < ceiling)
++        ceiling = (reported / MEM_ALIGN) * MEM_ALIGN;
++    return ceiling;
++}
+ 
+ static constexpr size_t RESERVE_TLS   = 4   * MB;
+ static constexpr size_t RESERVE_RAZOR = 2   * MB;
+@@ -39,7 +57,7 @@ static constexpr size_t RESERVE_CPU   = 112 * MB;
+ 
+ extern "C" int user_malloc_init(void)
+ {
+-    s_memLength = HEAP_TOTAL
++    s_memLength = Ps4DirectMemoryCeiling()
+                   - RESERVE_TLS
+                   - RESERVE_RAZOR
+                   - RESERVE_SAVES
+@@ -49,7 +67,7 @@ extern "C" int user_malloc_init(void)
+     // Allocate direct (physical) memory from the kernel
+     int res = sceKernelAllocateDirectMemory(
+         /*searchStart*/ 0,
+-        /*searchEnd*/   SCE_KERNEL_MAIN_DMEM_SIZE,
++        /*searchEnd*/   static_cast<off_t>(Ps4DirectMemoryCeiling()),
+         /*len*/         s_memLength,
+         /*alignment*/   MEM_ALIGN,
+         /*memoryType*/  SCE_KERNEL_WB_ONION,
+diff --git a/PS4_PRO_BUILD_NOTES.md b/PS4_PRO_BUILD_NOTES.md
+new file mode 100644
+index 0000000..f606928
+--- /dev/null
++++ b/PS4_PRO_BUILD_NOTES.md
+@@ -0,0 +1,62 @@
++# PS4 Pro (OpenOrbis) build — what this patch does and what is still missing
++
++Apply with `git apply ps4-pro.patch` on `elripalda/gta4-ps5` @ `c628283`.
++
++## What is implemented
++
++1. **`glue/` unblocked for PS4**
++   - `glue/CMakeLists.txt`: `REXGLUE_USE_VULKAN` is `OFF` only for PS4 (`ON` stays for the PS5/RADV build), `REXGLUE_ENABLE_FIDELITYFX=OFF`, `LIBERTY_RECOMP_GNM=ON`.
++   - `glue/rexglue-sdk-main/CMakeLists.txt`: backend `FATAL_ERROR` relaxed for `LIBERTY_RECOMP_GNM`, added `elseif(PS4)` platform detection (`REX_PLATFORM="ps4-amd64"`, no `ps5_compat.h`).
++   - `src/core/CMakeLists.txt`: real `elseif(PS4)` source list using the existing `memory_ps4.cpp`, `threading_ps4.cpp`, `dynlib_ps4.cpp`, `fiber_ps4.cpp`, `logging_ps4.cpp`, `net_ps4.cpp`, `keyboard_dialog_ps4.cpp`, `ucontext_ps4.c` instead of the POSIX counterparts (avoids duplicate symbols and the `REX_PLATFORM_LINUX` static_assert).
++   - `src/input/CMakeLists.txt` + `input_system.cpp`: `ps4/ps4_input_driver.cpp` and a `REX_PLATFORM_PS4` branch in `CreateDefaultInputSystem()`.
++   - `src/audio/CMakeLists.txt`: `orbis/orbis_audio_system.cpp` + `orbis_audio_driver.cpp`.
++   - `src/graphics/CMakeLists.txt`: `rexgpu-xenos` skipped for PS4 (the `REXGLUE_USE_VULKAN` block with `rexgpu-gta4-native` is skipped automatically).
++   - `gta4-recomp/CMakeLists.txt`: `elseif(PS4)` INTERFACE consumer with `LIBERTY_RECOMP_PS4`, 1920x1080 defines, no PS5 hub/RADV/FSR3.
++   - `toolchains/ps4-openorbis.cmake`: sets `PS4`, `-march=btver2` (Jaguar), generates an `orbis-ld` wrapper in the build tree, makes `libcxx_ps4_compat.a` optional, adds `LIBERTY_PS4_NEO_MODE` / `LIBERTY_PS4_GAME_ROOT` / 1920x1080 cache variables. Root CMakeLists no longer injects `-march=sandybridge` for PS4.
++
++2. **Neo memory + 1080p**
++   - `LibertyRecomp/os/ps4/user_malloc_ps4.cpp`: `sceKernelIsNeoMode()` + `sceKernelGetDirectMemorySize()`, `HEAP_TOTAL_NEO = 5120 * MB`, fallback `HEAP_TOTAL_BASE = 4608 * MB`, and the kernel-reported size as a hard cap.
++   - `glue/rexglue-sdk-main/src/core/memory_ps4.cpp`: `searchEnd` from `sceKernelGetDirectMemorySize()` instead of `SCE_KERNEL_MAIN_DMEM_SIZE`, new fallback ladder 5 GiB → 4.5 GiB → 4/2/1 GiB, logs Neo mode.
++   - `src/ui/window.cpp`: `resolution` defaults to `"1080p"` on `REX_PLATFORM_PS4` (`video_mode_util.h` maps it to 1920x1080).
++   - `src/graphics/pipeline/texture/cache.cpp`: PS4 soft/hard texture cache 192/384 MB instead of 384/768 MB.
++   - `gta4-recomp/src/gta4_app.cpp`: PS4 defaults 256 shadow-map base, shadow distance 1.0, reflections `original` / cap `1080p`, FXAA, draw distance 1.0.
++   - `LibertyRecomp/CMakeLists.txt`: `LIBERTY_PS4_NEO_MODE` → `ATTRIBUTE = 1 << 23 = 8388608` in `param.sfo` (both the PkgTool.Core path and the Python path), plus a self-contained `tools/ps4/sfo_neo.py` generator/patcher so a stock OpenOrbis checkout (which has no `make_param_sfo.py`) still produces a real SFO.
++
++3. **No 7 GB payload at build time**
++   - `CMakeLists.txt`: `LIBERTY_RECOMP_SKIP_GAME_PAYLOAD` option. When ON, the root CMake creates four zero-byte stubs in `${CMAKE_BINARY_DIR}/ps4_empty_game_payload/`, repoints `LIBERTY_RECOMP_EMBEDDED_GAME_PATH` there and skips both FATAL_ERROR validations (root and `LibertyRecomp/CMakeLists.txt`).
++   - `LibertyRecomp/CMakeLists.txt`: skips `copy_directory` of the payload into the PKG staging area when the option is ON.
++   - `CMakePresets.json`: new `ps4-pro-release` configure + build presets with all of the above ON.
++   - `.github/workflows/build-ps4-pro.yml`: Ubuntu 24.04 CI job that installs clang/lld/ninja/CMake 3.31, fetches the OpenOrbis repo + the v0.5.3 prebuilt host binaries, runs `./setup.sh`, configures `ps4-pro-release`, builds `LibertyRecomp` (→ `eboot.bin`) and `LibertyRecomp-sfo` (→ `param.sfo`), verifies the Neo bit and uploads both files as an artefact.
++
++## Where the PS4 code reads the game files at runtime
++
++**Not `/data/gta4/` in the original code.** `LibertyRecomp/install/embedded_assets.cpp::ResolveEmbeddedGameRoot()` and `LibertyRecomp/install/platform_paths.cpp::PlatformPaths::GetGameDirectory()` both hard-coded `/app0/game` — the read-only PKG mount. `LibertyRecomp/os/ps4/ps4_main.cpp` itself only initialises the heap, sceUserService, sysmodules, net, trophies and the save-data mount (`/user/data/LBTY00001/`, exposed as `/savedata0`), then calls `main()`; it does not open any RPF.
++
++This patch adds `LibertyRecomp/install/ps4_game_root.h`, used by both functions:
++
++- default: `/app0/game` (compiled from the `LIBERTY_PS4_GAME_ROOT` CMake cache variable);
++- override at runtime: the `LIBERTY_PS4_GAME_ROOT` **environment variable**, e.g. `LIBERTY_PS4_GAME_ROOT=/data/gta4`.
++
++So to supply the real files yourself, extract the USA Xbox 360 disc + TU8 into `/data/gta4/` on the jailbroken console (or any readable path), set the env var (or bake another default with `-DLIBERTY_PS4_GAME_ROOT=/data/gta4` at configure time), and put `default.xex`, `common.rpf`, `xbox360.rpf`, `audio.rpf` there. Saves still go to `/user/data/LBTY00001/` and the trophy pack to `sce_sys/`.
++
++## Honest limitations — this is a revived configure/build path, not a guaranteed green build
++
++I could not compile `eboot.bin` in this sandbox: it has only Python, `gcc` and `make` — no `cmake`, `clang`, `lld`, `ninja` or the OpenOrbis SDK. The workflow is the executable equivalent. Remaining upstream gaps that a CI run will expose:
++
++- The GNM renderer in `LibertyRecomp/gpu/video.cpp` is a legacy D3D11-style path; `toolchains/ps4-openorbis.cmake` claims it is used on PS4, but no `LIBERTY_RECOMP_GNM` compile switch exists in `LibertyRecomp/CMakeLists.txt` and `glue/CMakeLists.txt` previously forced Vulkan. This patch removes the blocker but does not rewrite the renderer backend selection; expect link/render work.
++- The PS4 core source list in `src/core/CMakeLists.txt` is new. `exception_handler_posix.cpp` is replaced by `exception_handler_ps4.cpp` (Linux `gregs[REG_RIP]` does not exist in Orbis musl); the new backend keeps the handler list but does **not** install SIGSEGV/SIGBUS handlers, so guest MMIO faults are not recovered. Some other POSIX files (`mapped_memory_posix.cpp` → `shm_open`, `filesystem_posix.cpp` → `<ftw.h>`/`<pwd.h>`) may need Orbis-specific stubs; verify symbol uniqueness and missing headers on first compile. All eight `static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, ...)` in `src/core/*_posix.cpp` now also accept `REX_PLATFORM_PS4`.
++- Stock OpenOrbis has no `libcxx_ps4_compat.a` (it is a locally rebuilt LLVM 21 libc++); the toolchain now skips it. C++23 headers then come from the host clang, which may need additional `-isystem` tuning.
++- `create-fself` from release v0.5.3 is used to produce `eboot.bin`; `create-gp4`/`PkgTool.Core` PKG generation is best-effort (`continue-on-error: true` in CI).
++- The PS5/RADV tree (`ps5/`, `glue/.../src/ps5/`, `patches/liberty-ps5.patch`) is untouched. All new branches are guarded by `PS4` / `LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "ps4"`.
++
++## Local build (Ubuntu 24.04)
++
++```bash
++git clone --depth 1 https://github.com/elripalda/gta4-ps5.git && cd gta4-ps5
++git apply /path/to/ps4-pro.patch
++export OO_PS4_TOOLCHAIN="$PWD/tools/OpenOrbis-PS4-Toolchain"
++./setup.sh
++cmake --preset ps4-pro-release -DLIBERTY_PS4_GAME_ROOT=/data/gta4
++cmake --build out/build/ps4-pro-release --target LibertyRecomp LibertyRecomp-sfo -j2
++python3 tools/ps4/sfo_neo.py inspect out/build/ps4-pro-release/pkg_staging/sce_sys/param.sfo
++```
+diff --git a/PS4_PRO_BUILD_NOTES_RU.md b/PS4_PRO_BUILD_NOTES_RU.md
+new file mode 100644
+index 0000000..c6a28e3
+--- /dev/null
++++ b/PS4_PRO_BUILD_NOTES_RU.md
+@@ -0,0 +1,100 @@
++# PS4 Pro / OpenOrbis: что сделано, где лежат файлы игры, как собрать
++
++Патч: `ps4-pro.patch` (применяется к `elripalda/gta4-ps5`, коммит `c628283b018ea46077e0e30ff4cac7ab959a6de5`).
++Ветка PS5 / RADV (`ps5/`, `glue/.../src/ps5/`, `patches/liberty-ps5.patch`) **не изменена**.
++
++---
++
++## 1. Что исправлено в `glue/` (PS4 больше не упирается в Vulkan)
++
++- `glue/CMakeLists.txt`: для PS4 `REXGLUE_USE_VULKAN=OFF`, `REXGLUE_USE_D3D12=OFF`, `REXGLUE_ENABLE_FIDELITYFX=OFF`, `LIBERTY_RECOMP_GNM=ON`. Для всех остальных (включая PS5/RADV) осталось `REXGLUE_USE_VULKAN=ON`, как было.
++- `glue/rexglue-sdk-main/CMakeLists.txt`: проверка «хотя бы один бэкенд» теперь разрешает и `LIBERTY_RECOMP_GNM`; добавлена ветка `if(PS4)` **перед** `UNIX`, чтобы Orbis не определялся как Linux; для PS4 не подключается `ps5_compat.h` и не включается `-mcmodel=large`.
++- `src/core/CMakeLists.txt`: настоящая ветка `elseif(PS4)` с уже существующими `memory_ps4.cpp`, `threading_ps4.cpp`, `dynlib_ps4.cpp`, `fiber_ps4.cpp`, `logging_ps4.cpp`, `net_ps4.cpp`, `keyboard_dialog_ps4.cpp`, `ucontext_ps4.c`. Вместо `exception_handler_posix.cpp` (Linux `gregs[REG_RIP]`) добавлен `exception_handler_ps4.cpp`. Восемь `static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, ...)` дополнены `|| REX_PLATFORM_PS4`.
++- `src/input/CMakeLists.txt` + `input_system.cpp`: подключён `ps4/ps4_input_driver.cpp` и ветка `REX_PLATFORM_PS4` в `CreateDefaultInputSystem()`.
++- `src/audio/CMakeLists.txt` + `src/ui/rex_app.cpp`: подключены `orbis/orbis_audio_system.cpp`, `orbis_audio_driver.cpp` и выбран `OrbisAudioSystem` как `audio_factory` для PS4 (SDL-бэкенд на Orbis не работает).
++- Публичные заголовки вынесены в `include/rex/input/ps4/` и `include/rex/audio/orbis/`, чтобы исполняемый модуль мог их видеть; старые `src/.../*.h` стали тонкими forwarding-заголовками.
++- `src/graphics/CMakeLists.txt`: `rexgpu-xenos` на PS4 не собирается; блок `REXGLUE_USE_VULKAN` с `rexgpu-gta4-native` пропускается автоматически.
++- `gta4-recomp/CMakeLists.txt`: добавлена ветка `elseif(PS4)` (INTERFACE-библиотека с `LIBERTY_RECOMP_PS4` и 1920×1080), без PS5 hub / RADV / FSR3.
++- `toolchains/ps4-openorbis.cmake`: выставляет `PS4`, `-march=btver2` (Jaguar), сам создаёт `orbis-ld` в каталоге сборки, делает `libcxx_ps4_compat.a` необязательным, добавляет опции `LIBERTY_PS4_NEO_MODE`, `LIBERTY_PS4_GAME_ROOT`, 1920/1080. Корневой `CMakeLists.txt` больше не подсовывает PS4 `-march=sandybridge`.
++
++## 2. PS4 Pro / Neo и 1080p
++
++- `LibertyRecomp/os/ps4/user_malloc_ps4.cpp`: `sceKernelIsNeoMode()` + `sceKernelGetDirectMemorySize()`; `HEAP_TOTAL_NEO = 5120 * MB` (5 GiB), `HEAP_TOTAL_BASE = 4608 * MB` (4.5 GiB) как fallback; размер, который вернул kernel, — жёсткий потолок.
++- `glue/rexglue-sdk-main/src/core/memory_ps4.cpp`: `searchEnd` берётся из `sceKernelGetDirectMemorySize()`, а не из константы `SCE_KERNEL_MAIN_DMEM_SIZE`; лестница fallback 5 GiB → 4.5 GiB → 4/2/1 GiB; в лог выводится Neo mode.
++- `src/ui/window.cpp`: `resolution` по умолчанию `"1080p"` на `REX_PLATFORM_PS4` (в `video_mode_util.h` это 1920×1080), а не `"4k"` как на PS5.
++- `src/graphics/pipeline/texture/cache.cpp`: кэш текстур на PS4 192 / 384 МБ вместо 384 / 768 МБ.
++- `gta4-recomp/src/gta4_app.cpp`: на PS4 тени 256 вместо 512, `gta4_shadow_distance_scale = 1.0`, отражения `original` с потолком `1080p`, FXAA вместо SMAA, `gta4_draw_distance_scale = 1.0` вместо 3.0.
++- `LibertyRecomp/CMakeLists.txt`: опция `LIBERTY_PS4_NEO_MODE` (по умолчанию ON) выставляет бит 23 в `ATTRIBUTE` файла `param.sfo`: `1 << 23 = 0x800000 = 8388608`. Именно этот бит включает Neo/Pro и даёт +512 МиБ direct memory. Бит проставляется и в ветке PkgTool.Core, и в Python-ветке.
++- Так как в OpenOrbis **нет** `scripts/make_param_sfo.py` (проверено: 404), добавлен самодостаточный `tools/ps4/sfo_neo.py`, который умеет `create`, `patch`, `inspect` настоящего SFO (формат PSF, `0x0404` = uint32, `0x0204` = UTF-8). Даже если генератор отсутствует, `param.sfo` будет настоящим, а не пустой заглушкой.
++
++## 3. `eboot.bin` без 7 ГБ ассетов
++
++- Новая опция `LIBERTY_RECOMP_SKIP_GAME_PAYLOAD` (по умолчанию OFF, в новом пресете ON). При ON корневой `CMakeLists.txt` создаёт в **каталоге сборки** `ps4_empty_game_payload/` с четырьмя пустыми файлами `default.xex`, `common.rpf`, `xbox360.rpf`, `audio.rpf`, переопределяет на него `LIBERTY_RECOMP_EMBEDDED_GAME_PATH` и не падает на `FATAL_ERROR`.
++- В `LibertyRecomp/CMakeLists.txt` снята вторая проверка тех же файлов и оба `copy_directory` в PKG-staging (переменная `_ps4_copy_game_payload`), чтобы в PKG не тащились пустышки/7 ГБ.
++- `CMakePresets.json`: новый пресет `ps4-pro-release` (configure + build) со всеми нужными `cacheVariables`.
++- `.github/workflows/build-ps4-pro.yml`: Ubuntu 24.04, clang/lld/ninja/CMake 3.31, скачивает репозиторий OpenOrbis и готовые host-бинарники релиза `v0.5.3` (`create-fself`, `create-gp4`, `PkgTool.Core`, `include/orbis`, `link.x`, `lib/crt1.o`), запускает `./setup.sh`, конфигурирует `ps4-pro-release`, собирает `LibertyRecomp` → `eboot.bin` и `LibertyRecomp-sfo` → `sce_sys/param.sfo`, проверяет бит 23 и выкладывает оба файла артефактом `gta4-ps4-pro-eboot`. PKG собирается best-effort (`continue-on-error: true`).
++- В `.gitignore` добавлены исключения `!/.github/workflows/build-ps4-pro.yml` и `!/tools/ps4/sfo_neo.py` — иначе репозиторий игнорировал бы оба файла.
++
++---
++
++## Где PS4-код читает файлы игры (главный вопрос)
++
++**В оригинале — `/app0/game`, а не `/data/gta4/`.**
++
++- `LibertyRecomp/install/embedded_assets.cpp` → `EmbeddedAssets::ResolveEmbeddedGameRoot()` возвращал `"/app0/game"`.
++- `LibertyRecomp/install/platform_paths.cpp` → `PlatformPaths::GetGameDirectory()` возвращал `"/app0/game"`.
++- DLC: `/app0/dlc`, манифест: `/app0/manifest.json`, AES-ключ: `/app0/aes_key.bin`.
++- Запись: `/user/data/LBTY00001/` (кэш и `shader_cache` внутри), сохранения монтируются как `/savedata0`.
++- `LibertyRecomp/os/ps4/ps4_main.cpp` сам RPF не открывает: он инициализирует кучу, `sceUserService`, sysmodules, сеть, трофеи и mount сохранений, затем зовёт `main()`.
++- При сборке PKG `LIBERTY_RECOMP_EMBEDDED_GAME_PATH` копировался в staging `game/`, что на консоли и превращалось в `/app0/game` (read-only).
++
++Патч добавляет `LibertyRecomp/install/ps4_game_root.h`, и обе функции теперь берут путь оттуда:
++
++| Что | Путь |
++| --- | --- |
++| По умолчанию (как было) | `/app0/game` |
++| CMake-переменная при конфигурации | `-DLIBERTY_PS4_GAME_ROOT=/data/gta4` |
++| Переменная окружения на консоли | `LIBERTY_PS4_GAME_ROOT=/data/gta4` |
++| В workflow по умолчанию | `/data/gta4` |
++
++То есть свои настоящие файлы вы кладёте либо в `/app0/game/` при пересборке PKG, либо в любой читаемый каталог (например `/data/gta4/`) и указываете его через `LIBERTY_PS4_GAME_ROOT`. Нужны `default.xex`, `common.rpf`, `xbox360.rpf`, `audio.rpf` из USA Xbox 360 диска + TU8 (точные хэши — в отчёте `/home/user/LibertyRecomp_PS5_PS4Pro_otchet.md`). Сохранения и кэш по-прежнему пишутся в `/user/data/LBTY00001/`, трофеи — в `sce_sys/`.
++
++---
++
++## Как применить
++
++```bash
++git clone --depth 1 https://github.com/elripalda/gta4-ps5.git && cd gta4-ps5
++git apply /path/to/ps4-pro.patch
++git add -A && git commit -m "PS4 Pro (OpenOrbis): Neo mode, 1080p, payload-free build"
++git push origin HEAD:ps4-pro
++```
++
++Дальше в GitHub: **Actions → Build PS4 Pro (OpenOrbis / Neo / 1080p) → Run workflow**. Параметры `neo_mode`, `skip_game_payload`, `ps4_game_root` можно менять. После успеха скачивайте артефакт `gta4-ps4-pro-eboot` (`eboot.bin` + `sce_sys/param.sfo`).
++
++Локально на Ubuntu 24.04:
++
++```bash
++export OO_PS4_TOOLCHAIN="$PWD/tools/OpenOrbis-PS4-Toolchain"
++./setup.sh
++cmake --preset ps4-pro-release -DLIBERTY_PS4_GAME_ROOT=/data/gta4
++cmake --build out/build/ps4-pro-release --target LibertyRecomp LibertyRecomp-sfo -j2
++python3 tools/ps4/sfo_neo.py inspect out/build/ps4-pro-release/pkg_staging/sce_sys/param.sfo
++# ATTRIBUTE = 0x00800000 (8388608); Neo bit 23 = SET
++```
++
++---
++
++## Честно про ограничения
++
++**`eboot.bin` в этой песочнице не собран**: здесь есть только Python, `gcc` и `make`; нет `clang`, `lld`, `ninja` и SDK OpenOrbis. Готовый workflow — это и есть исполняемый эквивалент сборки: он сделает `eboot.bin` на GitHub. Я проверил: патч применяется к чистому клону (`git apply --check`), все CMake-файлы парсятся `cmake-format`, `CMakePresets.json` и YAML валидны, `sfo_neo.py` создаёт/патчит/читает настоящий SFO с битом 23, корневой `CMakeLists.txt` и toolchain проходят конфигурацию CMake до проверки сторонних зависимостей.
++
++Что всё ещё может всплыть при первом реальном билде (это оживимая конфигурация, а не гарантированно зелёный билд):
++
++1. `LibertyRecomp/gpu/video.cpp` — legacy D3D11-подобный путь; `toolchains/ps4-openorbis.cmake` утверждает, что на PS4 используется GNM, но отдельного переключателя `LIBERTY_RECOMP_GNM` в `LibertyRecomp/CMakeLists.txt` нет. Патч убирает блокировку Vulkan, но не переписывает выбор рендерера — возможна работа на этапе линковки/рендера.
++2. Новый список исходников `src/core` для PS4: `mapped_memory_posix.cpp` (`shm_open`) и `filesystem_posix.cpp` (`<ftw.h>`, `<pwd.h>`, `<libgen.h>`) могут потребовать Orbis-заглушек. `exception_handler_ps4.cpp` пока не ставит обработчики SIGSEGV/SIGBUS, поэтому гостевые MMIO-fault'ы не восстанавливаются.
++3. В релизе OpenOrbis нет `libcxx_ps4_compat.a` (это локально пересобранный libc++ LLVM 21) — toolchain теперь просто пропускает его; заголовки C++23 берутся от host clang и могут потребовать дополнительных `-isystem`.
++4. `create-fself` берётся из релиза `v0.5.3`; `create-gp4`/`PkgTool.Core` для PKG — best-effort.
++5. `#include <orbis/AudioOut.h>`, `sceKernelIsNeoMode()`, `sceKernelGetDirectMemorySize()` объявлены в `include/orbis/libkernel.h` релиза — проверено.
++
++PS5/RADV-код не тронут: все новые ветки защищены `PS4`, `LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "ps4"` или `REX_PLATFORM_PS4`.
+diff --git a/glue/CMakeLists.txt b/glue/CMakeLists.txt
+index 271e13b..dea222b 100644
+--- a/glue/CMakeLists.txt
++++ b/glue/CMakeLists.txt
+@@ -1,7 +1,18 @@
+-set(REXGLUE_USE_VULKAN ON CACHE BOOL "" FORCE)
+-set(REXGLUE_USE_D3D12 OFF CACHE BOOL "" FORCE)
+-set(REXGLUE_ENABLE_FIDELITYFX OFF CACHE BOOL "Enable optional FidelityFX temporal providers")
+-set(REXGLUE_BUILD_TESTS OFF CACHE BOOL "")
++# [ps4 pro] PS4 / OpenOrbis has no Vulkan ICD: the legacy tree renders through
++# the GNM-backed path in LibertyRecomp/gpu/video.cpp. The PS5/RADV build keeps
++# the original unconditional Vulkan=ON behaviour below.
++if(PS4 OR LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "ps4" OR CMAKE_SYSTEM_NAME STREQUAL "PS4")
++    set(REXGLUE_USE_VULKAN OFF CACHE BOOL "" FORCE)
++    set(REXGLUE_USE_D3D12 OFF CACHE BOOL "" FORCE)
++    set(REXGLUE_ENABLE_FIDELITYFX OFF CACHE BOOL "" FORCE)
++    set(LIBERTY_RECOMP_GNM ON CACHE BOOL "Use GNM-native renderer on PS4" FORCE)
++    set(REXGLUE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
++else()
++    set(REXGLUE_USE_VULKAN ON CACHE BOOL "" FORCE)
++    set(REXGLUE_USE_D3D12 OFF CACHE BOOL "" FORCE)
++    set(REXGLUE_ENABLE_FIDELITYFX OFF CACHE BOOL "Enable optional FidelityFX temporal providers")
++    set(REXGLUE_BUILD_TESTS OFF CACHE BOOL "")
++endif()
+ 
+ set(REXSDK_DIR "${CMAKE_SOURCE_DIR}/glue/rexglue-sdk-main"
+     CACHE PATH "Path to the Graine RexGlue SDK source tree")
+diff --git a/glue/rexglue-sdk-main/CMakeLists.txt b/glue/rexglue-sdk-main/CMakeLists.txt
+index b72d4da..abe1099 100644
+--- a/glue/rexglue-sdk-main/CMakeLists.txt
++++ b/glue/rexglue-sdk-main/CMakeLists.txt
+@@ -44,8 +44,10 @@ else()
+     option(REXGLUE_USE_VULKAN "Enable Vulkan graphics backend" ON)
+ endif()
+ 
+-if(NOT REXGLUE_USE_D3D12 AND NOT REXGLUE_USE_VULKAN)
+-    message(FATAL_ERROR "At least one graphics backend must be enabled (REXGLUE_USE_D3D12 or REXGLUE_USE_VULKAN)")
++# [ps4 pro] GNM is a third backend (LibertyRecomp/gpu/video.cpp); it does not
++# need either the D3D12 or the Vulkan ReXGlue backend.
++if(NOT REXGLUE_USE_D3D12 AND NOT REXGLUE_USE_VULKAN AND NOT LIBERTY_RECOMP_GNM)
++    message(FATAL_ERROR "At least one graphics backend must be enabled (REXGLUE_USE_D3D12, REXGLUE_USE_VULKAN or LIBERTY_RECOMP_GNM)")
+ endif()
+ 
+ if (REXGLUE_ENABLE_FIDELITYFX AND
+@@ -122,7 +124,7 @@ if(NOT WIN32)
+     # Use appropriate code model based on architecture
+     # [ps5 port] PS5: the default (small) code model, as the PS5 linker script
+     # and signer expect.
+-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64" AND NOT APPLE AND NOT PS5)
++    if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64" AND NOT APPLE AND NOT PS5 AND NOT PS4)
+         # Large code model on Linux x86_64 for linking with very large recompiled executables (35MB+).
+         add_compile_options(-mcmodel=large)
+     else()
+@@ -163,7 +165,11 @@ if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+     list(GET CMAKE_OSX_ARCHITECTURES 0 REX_TARGET_PROCESSOR)
+ endif()
+ 
+-if(WIN32)
++if(PS4)
++    # [ps4 pro] Check first: CMAKE_SYSTEM_NAME=PS4 is a custom platform and
++    # CMake may still report UNIX=1 on some hosts. Orbis is NOT Linux.
++    set(REX_PLATFORM "ps4-amd64")
++elseif(WIN32)
+     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
+         set(REX_PLATFORM "win-amd64")
+     elseif(REX_TARGET_PROCESSOR MATCHES "aarch64|ARM64|arm64")
+diff --git a/glue/rexglue-sdk-main/gta4-recomp/CMakeLists.txt b/glue/rexglue-sdk-main/gta4-recomp/CMakeLists.txt
+index c2944f4..2019ae9 100644
+--- a/glue/rexglue-sdk-main/gta4-recomp/CMakeLists.txt
++++ b/glue/rexglue-sdk-main/gta4-recomp/CMakeLists.txt
+@@ -549,6 +549,24 @@ elseif(PS5)
+         liberty_stage_vulkan_temporal_archive(gta4)
+         set_property(SOURCE src/ps5/hub/hub_ui.cpp APPEND PROPERTY COMPILE_DEFINITIONS LIBERTY_HAS_FSR3=1)
+     endif()
++elseif(PS4)
++    # [ps4 pro] OpenOrbis build. The executable is the legacy LibertyRecomp
++    # target in ../../../LibertyRecomp (os/ps4/ps4_main.cpp + gpu/video.cpp);
++    # this Graine consumer therefore stays an INTERFACE library exactly like
++    # the desktop branch, but with PS4-specific defaults and no PS5 hub,
++    # RADV, FSR3 or Vulkan plugin sources.
++    add_library(gta4_recomp INTERFACE)
++    target_include_directories(gta4_recomp INTERFACE
++        ${CMAKE_CURRENT_SOURCE_DIR}
++        ${CMAKE_CURRENT_SOURCE_DIR}/generated
++    )
++    target_compile_definitions(gta4_recomp INTERFACE
++        LIBERTY_RECOMP_PS4=1
++        GTA4_PS4_OUTPUT_WIDTH=${LIBERTY_PS4_OUTPUT_WIDTH}
++        GTA4_PS4_OUTPUT_HEIGHT=${LIBERTY_PS4_OUTPUT_HEIGHT}
++    )
++    set(GTA4_RECOMP_GENERATED_SOURCES ${GENERATED_SOURCES} PARENT_SCOPE)
++    message(STATUS "PS4 Pro: Graine consumer as INTERFACE (GNM path, ${LIBERTY_PS4_OUTPUT_WIDTH}x${LIBERTY_PS4_OUTPUT_HEIGHT})")
+ else()
+     add_library(gta4_recomp INTERFACE)
+     target_include_directories(gta4_recomp INTERFACE
+diff --git a/glue/rexglue-sdk-main/gta4-recomp/src/gta4_app.cpp b/glue/rexglue-sdk-main/gta4-recomp/src/gta4_app.cpp
+index d3e0e00..6f337fa 100644
+--- a/glue/rexglue-sdk-main/gta4-recomp/src/gta4_app.cpp
++++ b/glue/rexglue-sdk-main/gta4-recomp/src/gta4_app.cpp
+@@ -22,6 +22,7 @@
+ #include <rex/graphics/video_mode_util.h>
+ #include <rex/kernel/xboxkrnl/threading.h>
+ #include <rex/cvar.h>
++#include <rex/platform.h>
+ #include <rex/logging.h>
+ #include <rex/runtime.h>
+ #include <rex/system/kernel_state.h>
+@@ -152,7 +153,9 @@ REXCVAR_DEFINE_DOUBLE(gta4_native_auto_hdr_shoulder_power, 2.5,
+                       "Auto HDR highlight shoulder exponent")
+     .range(1.0, 10.0);
+ 
+-REXCVAR_DEFINE_UINT32(gta4_shadow_map_base_size, REX_PLATFORM_ANDROID ? 256 : 512,
++// [ps4 pro] 1080p + Pro memory budget: smaller shadow cache and shorter
++// shadow distance, cheaper reflections and FXAA instead of SMAA.
++REXCVAR_DEFINE_UINT32(gta4_shadow_map_base_size, REX_PLATFORM_PS4 || REX_PLATFORM_ANDROID ? 256 : 512,
+                       "GTA IV/Graphics/Shadows",
+                       "Base shadow-map size (512 creates a 4096x4096 point-shadow cache)")
+     .range(256, 1024)
+@@ -160,16 +163,16 @@ REXCVAR_DEFINE_UINT32(gta4_shadow_map_base_size, REX_PLATFORM_ANDROID ? 256 : 51
+ REXCVAR_DEFINE_DOUBLE(gta4_shadow_distance_guard_factor, 1.0, "GTA IV/Graphics/Shadows",
+                       "Multiplier on the shadow distance owned by the 30 FPS guard")
+     .range(0.1, 1.0);
+-REXCVAR_DEFINE_DOUBLE(gta4_shadow_distance_scale, REX_PLATFORM_PS5 ? 1.0 : 2.0, "GTA IV/Graphics/Shadows",
++REXCVAR_DEFINE_DOUBLE(gta4_shadow_distance_scale, REX_PLATFORM_PS5 || REX_PLATFORM_PS4 ? 1.0 : 2.0, "GTA IV/Graphics/Shadows",
+                       "Multiplier applied to GTA IV's directional shadow range")
+     .range(0.1, 4.0)
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+-REXCVAR_DEFINE_STRING(gta4_reflection_resolution, REX_PLATFORM_ANDROID ? "original" : "1080p",
++REXCVAR_DEFINE_STRING(gta4_reflection_resolution, REX_PLATFORM_PS4 || REX_PLATFORM_ANDROID ? "original" : "1080p",
+                       "GTA IV/Graphics/Reflections",
+                       "Reflection resolution preset: original, 1080p, or full")
+     .allowed({"original", "1080p", "full"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+-REXCVAR_DEFINE_STRING(gta4_reflection_resolution_cap, "1440p", "GTA IV/Graphics/Reflections",
++REXCVAR_DEFINE_STRING(gta4_reflection_resolution_cap, REX_PLATFORM_PS4 ? "1080p" : "1440p", "GTA IV/Graphics/Reflections",
+                       "Maximum Full reflection resolution: 1080p, 1440p, or display")
+     .allowed({"1080p", "1440p", "display"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+@@ -198,7 +201,7 @@ REXCVAR_DEFINE_STRING(gta4_reflection_capture_distance, "original",
+                       "Exterior environment capture distance: near (20), original (40), extended (60), or "
+                       "far (80)")
+     .allowed({"near", "original", "extended", "far"});
+-REXCVAR_DEFINE_STRING(gta4_native_anti_aliasing, REX_PLATFORM_ANDROID || REX_PLATFORM_PS5 ? "fxaa" : "smaa",
++REXCVAR_DEFINE_STRING(gta4_native_anti_aliasing, REX_PLATFORM_ANDROID || REX_PLATFORM_PS5 || REX_PLATFORM_PS4 ? "fxaa" : "smaa",
+                       "GTA IV/Graphics/Anti-Aliasing",
+                       "Anti-aliasing: off, fxaa, smaa, deferred MSAA, or even-factor SSAA")
+     // `spatial` remains loadable as a deprecated compatibility alias. It is
+@@ -248,7 +251,7 @@ REXCVAR_DEFINE_DOUBLE(gta4_dynamic_draw_distance_min, 0.7, "GTA IV/Graphics/LOD"
+ REXCVAR_DEFINE_DOUBLE(gta4_draw_distance_dynamic_factor, 1.0, "GTA IV/Graphics/LOD",
+                       "Current dynamic draw-distance factor (managed automatically)")
+     .range(0.25, 1.0);
+-REXCVAR_DEFINE_DOUBLE(gta4_draw_distance_scale, REX_PLATFORM_ANDROID || REX_PLATFORM_PS5 ? 1.0 : 3.0,
++REXCVAR_DEFINE_DOUBLE(gta4_draw_distance_scale, REX_PLATFORM_ANDROID || REX_PLATFORM_PS5 || REX_PLATFORM_PS4 ? 1.0 : 3.0,
+                       "GTA IV/Graphics/LOD",
+                       "Multiplier applied through GTA IV's built-in world-distance input")
+     .range(0.25, 4.0);
+diff --git a/glue/rexglue-sdk-main/include/rex/audio/orbis/orbis_audio_driver.h b/glue/rexglue-sdk-main/include/rex/audio/orbis/orbis_audio_driver.h
+new file mode 100644
+index 0000000..c200b1d
+--- /dev/null
++++ b/glue/rexglue-sdk-main/include/rex/audio/orbis/orbis_audio_driver.h
+@@ -0,0 +1,27 @@
++#pragma once
++/** ReXGlue : PS4 Audio Driver (sceAudioOut) — public declaration. */
++#include <rex/platform.h>
++#if REX_PLATFORM_PS4
++#include <rex/audio/audio_driver.h>
++#include <rex/thread.h>
++namespace rex::audio::orbis {
++class OrbisAudioDriver : public AudioDriver {
++ public:
++  OrbisAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore);
++  ~OrbisAudioDriver() override;
++  bool Initialize();
++  void SubmitFrame(uint32_t frame_ptr) override;
++  void Shutdown();
++ private:
++  rex::thread::Semaphore* semaphore_ = nullptr;
++  int32_t audio_handle_ = -1;
++  static const uint32_t kFrequency = 48000;
++  static const uint32_t kInputChannels = 6;
++  static const uint32_t kOutputChannels = 2;
++  static const uint32_t kSamplesPerChannel = 256;
++  static const uint32_t kInputFrameSamples = kInputChannels * kSamplesPerChannel;
++  static const uint32_t kOutputFrameSamples = kOutputChannels * kSamplesPerChannel;
++  float output_buffer_[kOutputFrameSamples];
++};
++}  // namespace rex::audio::orbis
++#endif  // REX_PLATFORM_PS4
+diff --git a/glue/rexglue-sdk-main/include/rex/audio/orbis/orbis_audio_system.h b/glue/rexglue-sdk-main/include/rex/audio/orbis/orbis_audio_system.h
+new file mode 100644
+index 0000000..8ce6ed2
+--- /dev/null
++++ b/glue/rexglue-sdk-main/include/rex/audio/orbis/orbis_audio_system.h
+@@ -0,0 +1,20 @@
++#pragma once
++/** ReXGlue : PS4 Audio Backend (sceAudioOut) — public declaration. */
++#include <rex/platform.h>
++#if REX_PLATFORM_PS4
++#include <rex/audio/audio_system.h>
++namespace rex::audio::orbis {
++class OrbisAudioSystem : public AudioSystem {
++ public:
++  explicit OrbisAudioSystem(runtime::FunctionDispatcher* function_dispatcher);
++  ~OrbisAudioSystem() override;
++  static bool IsAvailable() { return true; }
++  static std::unique_ptr<AudioSystem> Create(runtime::FunctionDispatcher* function_dispatcher);
++  X_STATUS CreateDriver(size_t index, rex::thread::Semaphore* semaphore,
++                        AudioDriver** out_driver) override;
++  void DestroyDriver(AudioDriver* driver) override;
++ protected:
++  void Initialize() override;
++};
++}  // namespace rex::audio::orbis
++#endif  // REX_PLATFORM_PS4
+diff --git a/glue/rexglue-sdk-main/include/rex/input/ps4/ps4_input_driver.h b/glue/rexglue-sdk-main/include/rex/input/ps4/ps4_input_driver.h
+new file mode 100644
+index 0000000..f88ad45
+--- /dev/null
++++ b/glue/rexglue-sdk-main/include/rex/input/ps4/ps4_input_driver.h
+@@ -0,0 +1,52 @@
++#pragma once
++/**
++ * PS4 input driver backed by scePad (OpenOrbis DualShock 4 / DualSense).
++ * Public mirror of src/input/ps4/ps4_input_driver.h so the consumer
++ * executable can reference the type from CreateDefaultInputSystem().
++ */
++#include <rex/platform.h>
++
++#if REX_PLATFORM_PS4
++
++#include <array>
++#include <atomic>
++#include <mutex>
++#include <rex/input/input_driver.h>
++
++struct OrbisPadData;
++
++namespace rex::input::ps4 {
++
++static constexpr size_t kPS4UserCount = 4;
++
++class PS4InputDriver final : public InputDriver {
++ public:
++  explicit PS4InputDriver(rex::ui::Window* window, size_t window_z_order);
++  ~PS4InputDriver() override;
++  X_STATUS Setup() override;
++  X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
++                           X_INPUT_CAPABILITIES* out_caps) override;
++  X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state) override;
++  X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) override;
++  X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
++                        X_INPUT_KEYSTROKE* out_keystroke) override;
++
++ private:
++  struct PadSlot {
++    int32_t user_id = -1;
++    int32_t handle = -1;
++    uint32_t last_buttons = 0;
++    uint32_t packet_number = 0;
++    uint64_t last_timestamp = 0;
++    bool connected = false;
++  };
++  void RefreshUsers();
++  static void TranslatePadState(const ::OrbisPadData& pad, X_INPUT_GAMEPAD& out);
++  std::mutex mutex_;
++  std::array<PadSlot, kPS4UserCount> slots_{};
++  std::atomic<bool> pad_initialized_{false};
++  std::atomic<bool> user_service_initialized_{false};
++};
++
++}  // namespace rex::input::ps4
++#endif  // REX_PLATFORM_PS4
+diff --git a/glue/rexglue-sdk-main/src/audio/CMakeLists.txt b/glue/rexglue-sdk-main/src/audio/CMakeLists.txt
+index 24eb993..ba3c9c8 100644
+--- a/glue/rexglue-sdk-main/src/audio/CMakeLists.txt
++++ b/glue/rexglue-sdk-main/src/audio/CMakeLists.txt
+@@ -14,6 +14,9 @@ add_library(rexaudio OBJECT
+     sdl/sdl_audio_system.cpp
+     sdl/sdl_audio_driver.cpp
+     $<$<BOOL:${PS5}>:ps5/ps5_audio_driver.cpp>
++    # [ps4 pro] Orbis sceAudioOut backend (already present in this tree).
++    $<$<BOOL:${PS4}>:orbis/orbis_audio_system.cpp>
++    $<$<BOOL:${PS4}>:orbis/orbis_audio_driver.cpp>
+ )
+ add_library(rex::audio ALIAS rexaudio)
+ 
+diff --git a/glue/rexglue-sdk-main/src/audio/orbis/orbis_audio_driver.h b/glue/rexglue-sdk-main/src/audio/orbis/orbis_audio_driver.h
+index 336355b..e0475ca 100644
+--- a/glue/rexglue-sdk-main/src/audio/orbis/orbis_audio_driver.h
++++ b/glue/rexglue-sdk-main/src/audio/orbis/orbis_audio_driver.h
+@@ -1,47 +1,3 @@
+-/**
+- ******************************************************************************
+- * ReXGlue : PS4 Audio Backend (sceAudioOut)                                  *
+- ******************************************************************************
+- */
+-
+ #pragma once
+-
+-#if REX_PLATFORM_PS4
+-
+-#include <rex/audio/audio_driver.h>
+-#include <rex/thread.h>
+-
+-namespace rex::audio::orbis {
+-
+-class OrbisAudioDriver : public AudioDriver {
+- public:
+-  OrbisAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore);
+-  ~OrbisAudioDriver() override;
+-
+-  bool Initialize();
+-  void SubmitFrame(uint32_t frame_ptr) override;
+-  void Shutdown();
+-
+- private:
+-  rex::thread::Semaphore* semaphore_ = nullptr;
+-
+-  int32_t audio_handle_ = -1;
+-
+-  // Xbox 360 audio: 6 channels (5.1), 256 samples per channel, big-endian float.
+-  // PS4 output: stereo float (downmixed from 5.1).
+-  static const uint32_t kFrequency = 48000;
+-  static const uint32_t kInputChannels = 6;
+-  static const uint32_t kOutputChannels = 2;
+-  static const uint32_t kSamplesPerChannel = 256;
+-  static const uint32_t kInputFrameSamples = kInputChannels * kSamplesPerChannel;
+-  static const uint32_t kOutputFrameSamples = kOutputChannels * kSamplesPerChannel;
+-
+-  // Scratch buffer for the downmixed stereo frame submitted each SubmitFrame.
+-  // sceAudioOutOutput is synchronous (paces the audio thread), so no pool
+-  // is needed -- the buffer is reused on each call.
+-  float output_buffer_[kOutputFrameSamples];
+-};
+-
+-}  // namespace rex::audio::orbis
+-
+-#endif  // REX_PLATFORM_PS4
++// [ps4 pro] Public declaration in include/rex/audio/orbis/.
++#include <rex/audio/orbis/orbis_audio_driver.h>
+diff --git a/glue/rexglue-sdk-main/src/audio/orbis/orbis_audio_system.h b/glue/rexglue-sdk-main/src/audio/orbis/orbis_audio_system.h
+index 5e97ffa..b2f8681 100644
+--- a/glue/rexglue-sdk-main/src/audio/orbis/orbis_audio_system.h
++++ b/glue/rexglue-sdk-main/src/audio/orbis/orbis_audio_system.h
+@@ -1,34 +1,3 @@
+-/**
+- ******************************************************************************
+- * ReXGlue : PS4 Audio Backend (sceAudioOut)                                  *
+- ******************************************************************************
+- */
+-
+ #pragma once
+-
+-#if REX_PLATFORM_PS4
+-
+-#include <rex/audio/audio_system.h>
+-
+-namespace rex::audio::orbis {
+-
+-class OrbisAudioSystem : public AudioSystem {
+- public:
+-  explicit OrbisAudioSystem(runtime::FunctionDispatcher* function_dispatcher);
+-  ~OrbisAudioSystem() override;
+-
+-  static bool IsAvailable() { return true; }
+-
+-  static std::unique_ptr<AudioSystem> Create(runtime::FunctionDispatcher* function_dispatcher);
+-
+-  X_STATUS CreateDriver(size_t index, rex::thread::Semaphore* semaphore,
+-                        AudioDriver** out_driver) override;
+-  void DestroyDriver(AudioDriver* driver) override;
+-
+- protected:
+-  void Initialize() override;
+-};
+-
+-}  // namespace rex::audio::orbis
+-
+-#endif  // REX_PLATFORM_PS4
++// [ps4 pro] Public declaration in include/rex/audio/orbis/.
++#include <rex/audio/orbis/orbis_audio_system.h>
+diff --git a/glue/rexglue-sdk-main/src/core/CMakeLists.txt b/glue/rexglue-sdk-main/src/core/CMakeLists.txt
+index d269751..7ef4769 100644
+--- a/glue/rexglue-sdk-main/src/core/CMakeLists.txt
++++ b/glue/rexglue-sdk-main/src/core/CMakeLists.txt
+@@ -73,6 +73,33 @@ elseif(APPLE)
+         system_posix.cpp
+         threading_mac.cpp
+     )
++elseif(PS4)
++    # [ps4 pro] Orbis implementations replace their POSIX counterparts; do NOT
++    # compile both (memory_ps4.cpp and memory_posix.cpp export the same
++    # rex::memory::* symbols, threading_posix.cpp static_asserts on
++    # REX_PLATFORM_LINUX which is 0 on Orbis).
++    target_sources(rexcore PRIVATE
++        atomic_posix.cpp
++        clock_posix.cpp
++        dbg_posix.cpp
++        dynlib_ps4.cpp
++        exception_handler_ps4.cpp
++        filesystem_posix.cpp
++        fiber_ps4.cpp
++        mapped_memory_posix.cpp
++        math_gcc.cpp
++        memory_ps4.cpp
++        platform/console_posix.cpp
++        platform/env_posix.cpp
++        seh_posix.cpp
++        socket_posix.cpp
++        system_posix.cpp
++        threading_ps4.cpp
++        ucontext_ps4.c
++        logging_ps4.cpp
++        net_ps4.cpp
++        keyboard_dialog_ps4.cpp
++    )
+ elseif(UNIX)
+     if(ANDROID)
+         set(REXCORE_POSIX_FIBER fiber_android.cpp)
+@@ -136,6 +163,10 @@ if(PS5)
+     # [ps5 port] the SDK's libc has pthreads; there is no librt / libdl.
+     target_link_libraries(rexcore PUBLIC SceSystemService SceUserService ScePad SceAudioOut ps5platform)
+     target_sources(rexcore PRIVATE ps5_libc_extras.c ps5_diag.cpp)
++elseif(PS4)
++    # [ps4 pro] Orbis kernel/user/pad/audio stubs come from the OpenOrbis
++    # toolchain's link flags; no PS5 payload-SDK libraries here.
++    target_link_libraries(rexcore PRIVATE pthread)
+ elseif(APPLE)
+     target_link_libraries(rexcore PRIVATE pthread)
+ elseif(ANDROID)
+diff --git a/glue/rexglue-sdk-main/src/core/atomic_posix.cpp b/glue/rexglue-sdk-main/src/core/atomic_posix.cpp
+index 378aa4b..d7e9f50 100644
+--- a/glue/rexglue-sdk-main/src/core/atomic_posix.cpp
++++ b/glue/rexglue-sdk-main/src/core/atomic_posix.cpp
+@@ -1,7 +1,8 @@
+ #include <rex/platform.h>
+ #include <rex/thread/atomic.h>
+ 
+-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
++static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS4,
++              "[ps4 pro] Orbis is POSIX-like too");
+ 
+ namespace rex::thread {
+ 
+diff --git a/glue/rexglue-sdk-main/src/core/clock_posix.cpp b/glue/rexglue-sdk-main/src/core/clock_posix.cpp
+index f870b21..c68a994 100644
+--- a/glue/rexglue-sdk-main/src/core/clock_posix.cpp
++++ b/glue/rexglue-sdk-main/src/core/clock_posix.cpp
+@@ -10,7 +10,8 @@
+ #include <rex/chrono/clock.h>
+ #include <rex/platform.h>
+ 
+-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
++static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS4,
++              "[ps4 pro] Orbis is POSIX-like too");
+ 
+ #include <sys/time.h>
+ 
+diff --git a/glue/rexglue-sdk-main/src/core/dynlib_posix.cpp b/glue/rexglue-sdk-main/src/core/dynlib_posix.cpp
+index fcfd6c9..73707d2 100644
+--- a/glue/rexglue-sdk-main/src/core/dynlib_posix.cpp
++++ b/glue/rexglue-sdk-main/src/core/dynlib_posix.cpp
+@@ -1,7 +1,8 @@
+ #include <rex/platform.h>
+ #include <rex/platform/dynlib.h>
+ 
+-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
++static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS4,
++              "[ps4 pro] Orbis is POSIX-like too");
+ 
+ #include <dlfcn.h>
+ 
+diff --git a/glue/rexglue-sdk-main/src/core/exception_handler_ps4.cpp b/glue/rexglue-sdk-main/src/core/exception_handler_ps4.cpp
+new file mode 100644
+index 0000000..9cb44ec
+--- /dev/null
++++ b/glue/rexglue-sdk-main/src/core/exception_handler_ps4.cpp
+@@ -0,0 +1,54 @@
++/**
++ * [ps4 pro] Orbis exception-handler install path.
++ *
++ * exception_handler_posix.cpp reads Linux gregs[]/REG_RIP out of mcontext_t;
++ * OpenOrbis ships FreeBSD-style musl ucontext_t instead, so compiling that
++ * file for PS4 would either produce an empty translation unit (missing
++ * ExceptionHandler::Install / Uninstall, referenced by mmio_handler.cpp) or
++ * fail on Linux-only register macros.
++ *
++ * Orbis is a hard-fail console (no recoverable SIGSEGV dispatch to the guest
++ * MMIO handler), so this backend keeps the handler list but does not install
++ * signal handlers. If MMIO faults turn out to matter on the PS4, replace this
++ * with a FreeBSD mcontext adapter (ucontext_ps4.c documents the gregset
++ * indices: RIP=16, RSP=15, ...).
++ */
++#include <rex/platform.h>
++
++#if REX_PLATFORM_PS4
++
++#include <rex/exception_handler.h>
++#include <rex/assert.h>
++
++namespace rex::arch {
++namespace {
++constexpr size_t kMaxHandlerCount = 16;
++struct HandlerEntry {
++  ExceptionHandler::Handler fn = nullptr;
++  void* data = nullptr;
++};
++HandlerEntry g_handlers[kMaxHandlerCount]{};
++}  // namespace
++
++void ExceptionHandler::Install(Handler fn, void* data) {
++  for (size_t i = 0; i < kMaxHandlerCount; ++i) {
++    if (!g_handlers[i].fn) {
++      g_handlers[i].fn = fn;
++      g_handlers[i].data = data;
++      return;
++    }
++  }
++  assert_always("Too many exception handlers installed");
++}
++
++void ExceptionHandler::Uninstall(Handler fn, void* data) {
++  for (size_t i = 0; i < kMaxHandlerCount; ++i) {
++    if (g_handlers[i].fn == fn && g_handlers[i].data == data) {
++      g_handlers[i] = {};
++      return;
++    }
++  }
++}
++}  // namespace rex::arch
++
++#endif  // REX_PLATFORM_PS4
+diff --git a/glue/rexglue-sdk-main/src/core/memory_ps4.cpp b/glue/rexglue-sdk-main/src/core/memory_ps4.cpp
+index 7950633..ebb41b2 100644
+--- a/glue/rexglue-sdk-main/src/core/memory_ps4.cpp
++++ b/glue/rexglue-sdk-main/src/core/memory_ps4.cpp
+@@ -190,11 +190,23 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+   // header declares sceKernelAllocateMainDirectMemory's last arg as off_t
+   // (by value) rather than off_t* — passing an address via that signature
+   // is not portable. The 6-arg form matches user_malloc_ps4.cpp's pattern.
++  // [ps4 pro] Query the real direct-memory ceiling instead of the compile-time
++  // SCE_KERNEL_MAIN_DMEM_SIZE constant. Neo mode grants +512 MiB (5 GiB).
++  const size_t dmem_size = sceKernelGetDirectMemorySize();
++  const off_t  search_end = dmem_size ? static_cast<off_t>(dmem_size)
++                                      : static_cast<off_t>(SCE_KERNEL_MAIN_DMEM_SIZE);
++  // <cstdio> is already included; avoid pulling in the spdlog macro layer
++  // from this low-level allocator.
++  std::fprintf(stderr,
++               "[PS4 memory] direct memory %llu MiB, Neo mode %d\n",
++               static_cast<unsigned long long>(dmem_size / (1024u * 1024u)),
++               sceKernelIsNeoMode() != 0 ? 1 : 0);
++
+   off_t        dmem_offset  = 0;
+   size_t       effective_len = aligned_length;
+   int32_t      res          = sceKernelAllocateDirectMemory(
+       /*searchStart*/ 0,
+-      /*searchEnd*/   SCE_KERNEL_MAIN_DMEM_SIZE,
++      /*searchEnd*/   search_end,
+       /*len*/         effective_len,
+       /*alignment*/   kOrbisDirectAlign,
+       /*memoryType*/  SCE_KERNEL_WB_ONION,
+@@ -212,14 +224,19 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+                    "(res=0x%08x); falling back to smaller sizes.\n",
+                    aligned_length, static_cast<unsigned>(res));
+     }
++    // [ps4 pro] Try the Pro-sized reservation first, then the base-sized one,
++    // then progressively smaller footprints. A reduced guest arena is still
++    // better than a failed boot, but it must be visible in the log.
+     const size_t kFallbacks[] = {
+-        4ULL * 1024ULL * 1024ULL * 1024ULL,  // 4 GB
+-        2ULL * 1024ULL * 1024ULL * 1024ULL,  // 2 GB
+-        1ULL * 1024ULL * 1024ULL * 1024ULL,  // 1 GB
++        5ULL * 1024ULL * 1024ULL * 1024ULL,  // 5 GiB (PS4 Pro / Neo)
++        4608ULL * 1024ULL * 1024ULL,         // 4.5 GiB (base PS4)
++        4ULL * 1024ULL * 1024ULL * 1024ULL,  // 4 GiB
++        2ULL * 1024ULL * 1024ULL * 1024ULL,  // 2 GiB
++        1ULL * 1024ULL * 1024ULL * 1024ULL,  // 1 GiB
+     };
+     for (size_t fb : kFallbacks) {
+       if (fb >= aligned_length) continue;  // only try *smaller* than the ask
+-      res = sceKernelAllocateDirectMemory(0, SCE_KERNEL_MAIN_DMEM_SIZE, fb,
++      res = sceKernelAllocateDirectMemory(0, search_end, fb,
+                                           kOrbisDirectAlign,
+                                           SCE_KERNEL_WB_ONION, &dmem_offset);
+       if (res >= 0) {
+diff --git a/glue/rexglue-sdk-main/src/core/platform/console_posix.cpp b/glue/rexglue-sdk-main/src/core/platform/console_posix.cpp
+index 669842b..5bd288e 100644
+--- a/glue/rexglue-sdk-main/src/core/platform/console_posix.cpp
++++ b/glue/rexglue-sdk-main/src/core/platform/console_posix.cpp
+@@ -12,7 +12,8 @@
+ #include <rex/platform.h>
+ #include <rex/platform/console.h>
+ 
+-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
++static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS4,
++              "[ps4 pro] Orbis is POSIX-like too");
+ 
+ #include <unistd.h>
+ 
+diff --git a/glue/rexglue-sdk-main/src/core/platform/env_posix.cpp b/glue/rexglue-sdk-main/src/core/platform/env_posix.cpp
+index fb794b2..e12af12 100644
+--- a/glue/rexglue-sdk-main/src/core/platform/env_posix.cpp
++++ b/glue/rexglue-sdk-main/src/core/platform/env_posix.cpp
+@@ -12,7 +12,8 @@
+ #include <rex/platform.h>
+ #include <rex/platform/env.h>
+ 
+-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
++static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS4,
++              "[ps4 pro] Orbis is POSIX-like too");
+ 
+ #include <cstdlib>
+ #include <string>
+diff --git a/glue/rexglue-sdk-main/src/core/seh_posix.cpp b/glue/rexglue-sdk-main/src/core/seh_posix.cpp
+index 5e0a932..fb04f44 100644
+--- a/glue/rexglue-sdk-main/src/core/seh_posix.cpp
++++ b/glue/rexglue-sdk-main/src/core/seh_posix.cpp
+@@ -9,7 +9,8 @@
+ #include <rex/platform.h>
+ #include <rex/platform/seh.h>
+ 
+-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
++static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS4,
++              "[ps4 pro] Orbis is POSIX-like too");
+ 
+ #include <signal.h>
+ #include <cstdlib>  // std::abort()
+diff --git a/glue/rexglue-sdk-main/src/core/socket_posix.cpp b/glue/rexglue-sdk-main/src/core/socket_posix.cpp
+index 120e930..916a4c4 100644
+--- a/glue/rexglue-sdk-main/src/core/socket_posix.cpp
++++ b/glue/rexglue-sdk-main/src/core/socket_posix.cpp
+@@ -1,7 +1,8 @@
+ #include <rex/net/socket.h>
+ #include <rex/platform.h>
+ 
+-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
++static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS4,
++              "[ps4 pro] Orbis is POSIX-like too");
+ 
+ #include <cerrno>
+ #include <sys/ioctl.h>
+diff --git a/glue/rexglue-sdk-main/src/core/threading_posix.cpp b/glue/rexglue-sdk-main/src/core/threading_posix.cpp
+index 0556a09..4ba3bba 100644
+--- a/glue/rexglue-sdk-main/src/core/threading_posix.cpp
++++ b/glue/rexglue-sdk-main/src/core/threading_posix.cpp
+@@ -9,7 +9,8 @@
+ #include <rex/platform.h>
+ #include <rex/thread.h>
+ 
+-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
++static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS4,
++              "[ps4 pro] Orbis is POSIX-like too");
+ 
+ #include <signal.h>
+ 
+diff --git a/glue/rexglue-sdk-main/src/graphics/CMakeLists.txt b/glue/rexglue-sdk-main/src/graphics/CMakeLists.txt
+index e307c59..42209d4 100644
+--- a/glue/rexglue-sdk-main/src/graphics/CMakeLists.txt
++++ b/glue/rexglue-sdk-main/src/graphics/CMakeLists.txt
+@@ -147,7 +147,9 @@ endfunction()
+ 
+ # [ps5 port] one static program on the PS5: only the gta4-native renderer,
+ # linked in (gpu_plugin_loader.cpp calls it directly).
+-if(NOT PS5)
++# [ps4 pro] The Xenos/Vulkan plugin is a desktop/Android/PS5 artefact; the PS4
++# build uses the GNM-backed legacy renderer in LibertyRecomp/gpu/video.cpp.
++if(NOT PS5 AND NOT PS4)
+ add_library(rexgpu-xenos SHARED
+     plugin_main.cpp
+     ${REXGPU_XENOS_SOURCES}
+diff --git a/glue/rexglue-sdk-main/src/graphics/pipeline/texture/cache.cpp b/glue/rexglue-sdk-main/src/graphics/pipeline/texture/cache.cpp
+index 63f155f..5bf38f3 100644
+--- a/glue/rexglue-sdk-main/src/graphics/pipeline/texture/cache.cpp
++++ b/glue/rexglue-sdk-main/src/graphics/pipeline/texture/cache.cpp
+@@ -17,6 +17,7 @@
+ #include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
++#include <rex/platform.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/pipeline/texture/cache.h>
+ #include <rex/graphics/pipeline/texture/info.h>
+@@ -31,12 +32,16 @@ REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 24, "GPU",
+     .range(1, 256)
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+-REXCVAR_DEFINE_INT32(texture_cache_memory_limit_soft, 384, "GPU",
++// [ps4 pro] ~5.5 GB total on a Pro (5 GiB direct + ~448 MiB flexible). Keep
++// the host texture cache well below the desktop/PS5 defaults.
++REXCVAR_DEFINE_INT32(texture_cache_memory_limit_soft,
++                     REX_PLATFORM_PS4 ? 192 : 384, "GPU",
+                      "Soft texture cache memory limit (MB)")
+     .range(64, 4096)
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+-REXCVAR_DEFINE_INT32(texture_cache_memory_limit_hard, 768, "GPU",
++REXCVAR_DEFINE_INT32(texture_cache_memory_limit_hard,
++                     REX_PLATFORM_PS4 ? 384 : 768, "GPU",
+                      "Hard texture cache memory limit (MB)")
+     .range(128, 8192)
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+diff --git a/glue/rexglue-sdk-main/src/input/CMakeLists.txt b/glue/rexglue-sdk-main/src/input/CMakeLists.txt
+index 90f2bb7..25e8b94 100644
+--- a/glue/rexglue-sdk-main/src/input/CMakeLists.txt
++++ b/glue/rexglue-sdk-main/src/input/CMakeLists.txt
+@@ -15,6 +15,10 @@ add_library(rex::input ALIAS rexinput)
+ if(PS5)
+     # [ps5 port] DualSense through scePad
+     target_sources(rexinput PRIVATE ps5/ps5_input_driver.cpp)
++elseif(PS4)
++    # [ps4 pro] DualShock 4 through OpenOrbis scePad (no adaptive triggers,
++    # no light bar, no scePadSetVibrationMode(2)).
++    target_sources(rexinput PRIVATE ps4/ps4_input_driver.cpp)
+ endif()
+ 
+ target_include_directories(rexinput PUBLIC
+diff --git a/glue/rexglue-sdk-main/src/input/input_system.cpp b/glue/rexglue-sdk-main/src/input/input_system.cpp
+index d96f32c..e6c7125 100644
+--- a/glue/rexglue-sdk-main/src/input/input_system.cpp
++++ b/glue/rexglue-sdk-main/src/input/input_system.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <cmath>
+ 
++#include <rex/platform.h>
+ #include <rex/dbg.h>
+ #include <rex/input/flags.h>
+ #include <rex/input/absolute_pointer.h>
+@@ -23,6 +24,9 @@
+ #if REX_PLATFORM_PS5
+ #include <rex/input/ps5/ps5_input_driver.h>
+ #endif
++#if REX_PLATFORM_PS4
++#include <rex/input/ps4/ps4_input_driver.h>
++#endif
+ #include <rex/input/nop/nop_input_driver.h>
+ #if REX_PLATFORM_NX
+ #include "switch/switch_input_driver.h"
+@@ -395,6 +399,10 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
+     // [ps5 port] DualSense pads; SDL has no PS5 controller backend.
+     auto ps5_driver = std::make_unique<ps5::Ps5InputDriver>(nullptr, 0);
+     if (ps5_driver->Setup() == X_STATUS_SUCCESS) input->AddDriver(std::move(ps5_driver));
++#elif REX_PLATFORM_PS4
++    // [ps4 pro] Orbis pads; SDL has no scePad backend on the PS4.
++    auto ps4_driver = std::make_unique<ps4::PS4InputDriver>(nullptr, 0);
++    if (ps4_driver->Setup() == X_STATUS_SUCCESS) input->AddDriver(std::move(ps4_driver));
+ #else
+     const bool expose_sdl_gamepad_state = REXCVAR_GET(input_backend) == "sdl";
+     auto sdl_driver = std::make_unique<sdl::SDLInputDriver>(nullptr, 0, expose_sdl_gamepad_state);
+diff --git a/glue/rexglue-sdk-main/src/input/ps4/ps4_input_driver.h b/glue/rexglue-sdk-main/src/input/ps4/ps4_input_driver.h
+index bfa7af4..21ab5f9 100644
+--- a/glue/rexglue-sdk-main/src/input/ps4/ps4_input_driver.h
++++ b/glue/rexglue-sdk-main/src/input/ps4/ps4_input_driver.h
+@@ -1,64 +1,4 @@
+ #pragma once
+-/**
+- * PS4 input driver backed by scePad (OpenOrbis DualShock 4 / DualSense).
+- */
+-
+-#include <rex/platform.h>
+-
+-#if REX_PLATFORM_PS4
+-
+-#include <array>
+-#include <atomic>
+-#include <mutex>
+-
+-#include <rex/input/input_driver.h>
+-
+-// Forward-declared at global scope so the in-class reference below resolves
+-// to the OrbisPadData from <orbis/_types/pad.h>, not a new type in
+-// rex::input::ps4::.
+-struct OrbisPadData;
+-
+-namespace rex::input::ps4 {
+-
+-static constexpr size_t kPS4UserCount = 4;
+-
+-class PS4InputDriver final : public InputDriver {
+- public:
+-  explicit PS4InputDriver(rex::ui::Window* window, size_t window_z_order);
+-  ~PS4InputDriver() override;
+-
+-  X_STATUS Setup() override;
+-
+-  X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
+-                           X_INPUT_CAPABILITIES* out_caps) override;
+-  X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state) override;
+-  X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) override;
+-  X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
+-                        X_INPUT_KEYSTROKE* out_keystroke) override;
+-
+- private:
+-  struct PadSlot {
+-    int32_t user_id = -1;       // OrbisUserServiceUserId (-1 = empty)
+-    int32_t handle = -1;        // scePadOpen handle (-1 = not open)
+-    uint32_t last_buttons = 0;  // last OrbisPadData.buttons we saw
+-    uint32_t packet_number = 0;
+-    uint64_t last_timestamp = 0;
+-    bool connected = false;
+-  };
+-
+-  // Re-scan login user list and open/close pad handles accordingly.
+-  void RefreshUsers();
+-
+-  // Convert raw OrbisPadData into an X_INPUT_GAMEPAD (writes to out).
+-  static void TranslatePadState(const ::OrbisPadData& pad,
+-                                X_INPUT_GAMEPAD& out);
+-
+-  std::mutex mutex_;
+-  std::array<PadSlot, kPS4UserCount> slots_{};
+-  std::atomic<bool> pad_initialized_{false};
+-  std::atomic<bool> user_service_initialized_{false};
+-};
+-
+-}  // namespace rex::input::ps4
+-
+-#endif  // REX_PLATFORM_PS4
++// [ps4 pro] The declaration now lives in include/rex/input/ps4/ so consumers
++// can reference it. Keep this path for source-local includes.
++#include <rex/input/ps4/ps4_input_driver.h>
+diff --git a/glue/rexglue-sdk-main/src/ui/rex_app.cpp b/glue/rexglue-sdk-main/src/ui/rex_app.cpp
+index eb30130..5ae71a3 100644
+--- a/glue/rexglue-sdk-main/src/ui/rex_app.cpp
++++ b/glue/rexglue-sdk-main/src/ui/rex_app.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include <cstdlib>
+ 
++#include <rex/platform.h>
+ #include <rex/assert.h>
+ #include <rex/cvar.h>
+ #include <rex/ui/flags.h>
+@@ -28,6 +29,8 @@
+ #include <rex/audio/audio_system.h>
+ #if REX_PLATFORM_MAC && !REX_PLATFORM_IOS
+ #include <rex/audio/coreaudio/coreaudio_audio_system.h>
++#elif REX_PLATFORM_PS4
++#include <rex/audio/orbis/orbis_audio_system.h>
+ #else
+ #include <rex/audio/sdl/sdl_audio_system.h>
+ #endif
+@@ -404,6 +407,8 @@ bool ReXApp::SetupPresentation() {
+   config_.gpu_plugin = REXCVAR_GET(gpu_plugin);
+ #if REX_PLATFORM_MAC && !REX_PLATFORM_IOS
+   config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::coreaudio::CoreAudioAudioSystem);
++#elif REX_PLATFORM_PS4
++  config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::orbis::OrbisAudioSystem);
+ #else
+   config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
+ #endif
+diff --git a/glue/rexglue-sdk-main/src/ui/window.cpp b/glue/rexglue-sdk-main/src/ui/window.cpp
+index 122f5cc..aa79e8d 100644
+--- a/glue/rexglue-sdk-main/src/ui/window.cpp
++++ b/glue/rexglue-sdk-main/src/ui/window.cpp
+@@ -53,7 +53,9 @@ REXCVAR_DEFINE_INT32(video_mode_height, 720, "Display", "Guest video mode height
+ // Android: native 720p (the console's resolution); the presenter scales it to the panel.
+ // [ps5 port] PS5: 4K, the output's own (the hub sets it; the PS5's graphics
+ // card has room for it while the game's render thread is the limit).
+-REXCVAR_DEFINE_STRING(resolution, REX_PLATFORM_ANDROID ? "720p" : REX_PLATFORM_PS5 ? "4k" : "", "Display",
++// [ps4 pro] 1080p output, not the PS5's 4K. "1080p" maps to 1920x1080 in
++// include/rex/graphics/video_mode_util.h.
++REXCVAR_DEFINE_STRING(resolution, REX_PLATFORM_ANDROID ? "720p" : REX_PLATFORM_PS5 ? "4k" : REX_PLATFORM_PS4 ? "1080p" : "", "Display",
+                       "Common resolution preset for both guest video mode and startup window (for "
+                       "example: 720p, 1080p, 1440p, 4k, 1280x720)")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+diff --git a/toolchains/ps4-openorbis.cmake b/toolchains/ps4-openorbis.cmake
+index 16000b0..b55d4f6 100644
+--- a/toolchains/ps4-openorbis.cmake
++++ b/toolchains/ps4-openorbis.cmake
+@@ -40,6 +40,9 @@ message(STATUS "Using OpenOrbis PS4 Toolchain: ${OO_PS4_TOOLCHAIN}")
+ 
+ set(CMAKE_SYSTEM_NAME PS4)
+ set(CMAKE_SYSTEM_PROCESSOR x86_64)
++# [ps4 pro] Make the platform switch available to every CMakeLists in glue/.
++# CMake does not guarantee a PS4 variable for custom CMAKE_SYSTEM_NAME values.
++set(PS4 1 CACHE BOOL "Building for PS4 / OpenOrbis" FORCE)
+ 
+ # OpenOrbis sample builds target FreeBSD ELF and rely on link.x + create-fself
+ # for PS4-specific rewriting. Match that model instead of mixing in the
+@@ -71,7 +74,16 @@ set(CMAKE_ASM_COMPILER_TARGET "x86_64-pc-freebsd12-elf")
+ # the host lld (which natively supports the PS4/orbis linker flavor).
+ # -B tells clang where to find toolchain programs.
+ # Link PS4 system libraries: C/C++ runtime, kernel, and SDK stubs.
+-set(_PS4_LINK_FLAGS "-B ${OO_PS4_TOOLCHAIN}/bin")
++# [ps4 pro] Stock OpenOrbis releases ship bin/linux/create-fself but no
++# top-level bin/orbis-ld wrapper. Generate one in the build tree so clang's
++# -B lookup finds a host lld that understands the Orbis/FreeBSD ELF flavour.
++set(_PS4_ORBIS_BIN "${CMAKE_BINARY_DIR}/ps4-toolchain-bin")
++file(MAKE_DIRECTORY "${_PS4_ORBIS_BIN}")
++if(NOT EXISTS "${_PS4_ORBIS_BIN}/orbis-ld")
++    file(WRITE "${_PS4_ORBIS_BIN}/orbis-ld" "#!/bin/sh\nexec \"${LD_LLD_PATH}\" \"$@\"\n")
++    execute_process(COMMAND chmod +x "${_PS4_ORBIS_BIN}/orbis-ld")
++endif()
++set(_PS4_LINK_FLAGS "-B ${_PS4_ORBIS_BIN}")
+ # Match the canonical OpenOrbis sample build (samples/hello_world/Makefile):
+ # `-m elf_x86_64 -pie --script $(TOOLCHAIN)/link.x --eh-frame-hdr crt1.o`.
+ # The clang freebsd12 driver would otherwise inject its own crt1.o + crti.o +
+@@ -109,8 +121,12 @@ string(APPEND _PS4_LINK_FLAGS " ${OO_PS4_TOOLCHAIN}/lib/crt1.o")
+ # --allow-multiple-definition kept because libcxx_ps4_compat overlaps SDK libc++.
+ # TODO(ps4): move to one libc++ source — drop either the compat archive or
+ # the SDK -lc++/-lc++abi/-lunwind, and remove the workaround.
+-string(APPEND _PS4_LINK_FLAGS " -Wl,--allow-multiple-definition")
+-string(APPEND _PS4_LINK_FLAGS " ${OO_PS4_TOOLCHAIN}/lib/libcxx_ps4_compat.a")
++# [ps4 pro] libcxx_ps4_compat.a is a locally rebuilt LLVM 21 libc++ archive
++# that stock OpenOrbis releases do not ship. Only link it when present.
++if(EXISTS "${OO_PS4_TOOLCHAIN}/lib/libcxx_ps4_compat.a")
++    string(APPEND _PS4_LINK_FLAGS " -Wl,--allow-multiple-definition")
++    string(APPEND _PS4_LINK_FLAGS " ${OO_PS4_TOOLCHAIN}/lib/libcxx_ps4_compat.a")
++endif()
+ string(APPEND _PS4_LINK_FLAGS " -lc++ -lc++abi -lunwind -lc -lm")
+ string(APPEND _PS4_LINK_FLAGS " ${OO_PS4_TOOLCHAIN}/lib/libclang_rt.builtins-x86_64.a")
+ # PS4 kernel (provides pthread, sceKernel*, mmap, etc.)
+@@ -174,7 +190,8 @@ message(STATUS "PS4: Using Homebrew LLVM from ${_BREW_LLVM_DIR}")
+ #   instead of platform-specific _CTYPE_* / _IS* constants.
+ # Note: _LIBCPP_HAS_MUSL_LIBC and _LIBCPP_HAS_THREAD_API_PTHREAD are set
+ # via the __config_site overlay in include/c++/v1/__config_site.
+-set(_PS4_DEFINES "-D__ORBIS__ -D_GNU_SOURCE -U__FreeBSD__ -D_LIBCPP_PROVIDES_DEFAULT_RUNE_TABLE")
++# [ps4 pro] AMD Jaguar (btver2), not the PS5's Zen 2 and not Sandy Bridge.
++set(_PS4_DEFINES "-D__ORBIS__ -D_GNU_SOURCE -U__FreeBSD__ -D_LIBCPP_PROVIDES_DEFAULT_RUNE_TABLE -march=btver2")
+ 
+ # Suppress default includes and set our explicit ordered paths
+ # Modern clang may define wchar_t via stddef.h before OpenOrbis musl headers,
+@@ -210,6 +227,15 @@ set(LIBERTY_RECOMP_GNM ON CACHE BOOL "Use GNM-native renderer on PS4" FORCE)
+ # No installer wizard on PS4
+ set(LIBERTY_RECOMP_EMBEDDED_ASSETS ON CACHE BOOL "Package assets at build time (no installer UI)" FORCE)
+ 
++# [ps4 pro] PS4 Pro / Neo memory profile. ATTRIBUTE bit 23 (0x800000) in
++# param.sfo is what makes sceKernelIsNeoMode() return 1 and grants the extra
++# 512 MiB of direct memory (5 GiB instead of the base 4.5 GiB).
++option(LIBERTY_PS4_NEO_MODE "Enable PS4 Pro (Neo) memory mode: param.sfo ATTRIBUTE bit 23" ON)
++set(LIBERTY_PS4_GAME_ROOT "/app0/game" CACHE PATH
++    "Default runtime directory with default.xex + *.rpf (overridable via LIBERTY_PS4_GAME_ROOT env var)")
++set(LIBERTY_PS4_OUTPUT_WIDTH "1920" CACHE STRING "PS4 Pro output width")
++set(LIBERTY_PS4_OUTPUT_HEIGHT "1080" CACHE STRING "PS4 Pro output height")
++
+ # PKG output target name
+ set(LIBERTY_PS4_TITLE_ID "LBTY00001" CACHE STRING "PS4 title ID for PKG packaging")
+ set(LIBERTY_PS4_APP_VERSION "01.00" CACHE STRING "PS4 application version")
+diff --git a/tools/ps4/sfo_neo.py b/tools/ps4/sfo_neo.py
+new file mode 100644
+index 0000000..c8955a3
+--- /dev/null
++++ b/tools/ps4/sfo_neo.py
+@@ -0,0 +1,170 @@
++#!/usr/bin/env python3
++"""Create / patch a PS4 param.sfo, including the PS4 Pro (Neo) ATTRIBUTE bit.
++
++SFO layout (little endian):
++  header : magic 0x00505346 ("\\0PSF"), version 0x00000101,
++           key_table_start, data_table_start, tables_entries
++  index  : 16 bytes/entry: key_offset u16, param_fmt u16, param_len u32,
++           param_max_len u32, data_offset u32
++  keys   : NUL-terminated names, alphabetically ordered
++  data   : 0x0404 = uint32, 0x0204 = NUL-terminated UTF-8
++
++ATTRIBUTE bit 23 (0x00800000) enables PS4 Pro / Neo mode.
++"""
++import argparse
++import struct
++import sys
++
++MAGIC = 0x46535000  # b"\x00PSF" as little-endian u32
++VERSION = 0x00000101
++FMT_INT = 0x0404
++FMT_STR = 0x0204
++NEO_BIT = 1 << 23
++
++DEFAULT_ENTRIES = [
++    ("APP_TYPE", FMT_INT, 1, 4),
++    ("APP_VER", FMT_STR, "01.00", 8),
++    ("ATTRIBUTE", FMT_INT, 0, 4),
++    ("CATEGORY", FMT_STR, "gd", 4),
++    ("CONTENT_ID", FMT_STR, "EP0000-LBTY00001_00-0000000000000000", 48),
++    ("DOWNLOAD_DATA_SIZE", FMT_INT, 0, 4),
++    ("SYSTEM_VER", FMT_INT, 0, 4),
++    ("TITLE", FMT_STR, "Grand Theft Auto IV", 128),
++    ("TITLE_ID", FMT_STR, "LBTY00001", 12),
++    ("VERSION", FMT_STR, "01.00", 8),
++]
++
++
++def _encode(value, fmt, max_len):
++    if fmt == FMT_INT:
++        return struct.pack("<I", int(value) & 0xFFFFFFFF)
++    raw = str(value).encode("utf-8")
++    if len(raw) + 1 > max_len:
++        raw = raw[: max_len - 1]
++    return raw + b"\x00" * (max_len - len(raw))
++
++
++def build(entries):
++    entries = sorted(entries, key=lambda e: e[0])
++    key_table, key_offsets = bytearray(), {}
++    for name, *_ in entries:
++        key_offsets[name] = len(key_table)
++        key_table += name.encode("ascii") + b"\x00"
++    while len(key_table) % 4:
++        key_table += b"\x00"
++
++    data, index = bytearray(), bytearray()
++    for name, fmt, value, max_len in entries:
++        payload = _encode(value, fmt, max_len)
++        used = 4 if fmt == FMT_INT else len(str(value).encode("utf-8")) + 1
++        used = min(used, max_len)
++        index += struct.pack("<HHIII", key_offsets[name], fmt, used,
++                             max_len, len(data))
++        data += payload
++    while len(data) % 4:
++        data += b"\x00"
++
++    key_start = 20 + 16 * len(entries)
++    data_start = key_start + len(key_table)
++    header = struct.pack("<IIIII", MAGIC, VERSION, key_start, data_start,
++                         len(entries))
++    return bytes(header + index + key_table + data)
++
++
++def parse(buf):
++    if len(buf) < 20 or struct.unpack_from("<I", buf, 0)[0] != MAGIC:
++        raise ValueError("not a PSF/SFO file")
++    _, _, key_start, data_start, count = struct.unpack_from("<IIIII", buf, 0)
++    out = []
++    for i in range(count):
++        off = 20 + 16 * i
++        key_off, fmt, used, max_len, data_off = struct.unpack_from(
++            "<HHIII", buf, off)
++        end = buf.index(0, key_start + key_off)
++        name = buf[key_start + key_off:end].decode("ascii", "replace")
++        out.append([name, fmt, used, max_len, data_off])
++    return key_start, data_start, out
++
++
++def patch(path, attribute):
++    try:
++        buf = bytearray(open(path, "rb").read())
++        key_start, data_start, entries = parse(buf)
++    except Exception:
++        return False
++    for name, fmt, used, max_len, data_off in entries:
++        if name != "ATTRIBUTE":
++            continue
++        if fmt != FMT_INT or used < 4:
++            return False
++        pos = data_start + data_off
++        current = struct.unpack_from("<I", buf, pos)[0]
++        struct.pack_into("<I", buf, pos, (current | int(attribute)) & 0xFFFFFFFF)
++        open(path, "wb").write(buf)
++        return True
++    return False
++
++
++def inspect(path):
++    buf = open(path, "rb").read()
++    _, data_start, entries = parse(buf)
++    for name, fmt, used, max_len, data_off in entries:
++        if name == "ATTRIBUTE":
++            value = struct.unpack_from("<I", buf, data_start + data_off)[0]
++            print(f"ATTRIBUTE = 0x{value:08X} ({value}); Neo bit 23 = "
++                  f"{'SET' if value & NEO_BIT else 'clear'}")
++            return 0
++    print("ATTRIBUTE entry not found", file=sys.stderr)
++    return 1
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__)
++    sub = ap.add_subparsers(dest="cmd", required=True)
++    for name in ("create", "patch"):
++        p = sub.add_parser(name)
++        p.add_argument("path")
++        p.add_argument("--attribute", type=lambda x: int(x, 0), default=0)
++        p.add_argument("--title-id", default="LBTY00001")
++        p.add_argument("--content-id", default="EP0000-LBTY00001_00-0000000000000000")
++        p.add_argument("--title", default="Grand Theft Auto IV")
++        p.add_argument("--version", default="01.00")
++        p.add_argument("--category", default="gd")
++    p = sub.add_parser("inspect")
++    p.add_argument("path")
++    a = ap.parse_args()
++
++    if a.cmd == "inspect":
++        return inspect(a.path)
++
++    if a.cmd == "patch":
++        # If the file produced by make_param_sfo.py / PkgTool.Core is valid,
++        # just OR the bits into ATTRIBUTE. Otherwise regenerate a full SFO.
++        if patch(a.path, a.attribute):
++            print(f"patched {a.path}: ATTRIBUTE |= 0x{int(a.attribute):08X}")
++            return 0
++
++    entries = [
++        (name, fmt,
++         int(a.attribute) if name == "ATTRIBUTE" else value,
++         max_len)
++        for name, fmt, value, max_len in DEFAULT_ENTRIES
++    ]
++    for name, fmt, value, max_len in list(entries):
++        if name == "TITLE_ID":
++            entries[entries.index((name, fmt, value, max_len))] = (name, fmt, a.title_id, max_len)
++        elif name == "CONTENT_ID":
++            entries[entries.index((name, fmt, value, max_len))] = (name, fmt, a.content_id, max_len)
++        elif name == "TITLE":
++            entries[entries.index((name, fmt, value, max_len))] = (name, fmt, a.title, max_len)
++        elif name in ("APP_VER", "VERSION"):
++            entries[entries.index((name, fmt, value, max_len))] = (name, fmt, a.version, max_len)
++        elif name == "CATEGORY":
++            entries[entries.index((name, fmt, value, max_len))] = (name, fmt, a.category, max_len)
++    open(a.path, "wb").write(build(entries))
++    print(f"wrote {a.path}: ATTRIBUTE = 0x{int(a.attribute):08X}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
