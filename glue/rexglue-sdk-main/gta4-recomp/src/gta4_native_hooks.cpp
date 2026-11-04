@@ -64,6 +64,7 @@ REXCVAR_DECLARE(uint32_t, gta4_shadow_map_base_size);
 #if REX_PLATFORM_PS5
 REXCVAR_DECLARE(uint32_t, gta4_native_shadow_min_indices);
 REXCVAR_DECLARE(uint32_t, ps5_environment_reflection_every);
+REXCVAR_DECLARE(bool, ps5_smooth_40);
 REXCVAR_DECLARE(uint32_t, ps5_water_reflection_every);
 #endif
 REXCVAR_DEFINE_UINT32(gta4_shadow_cascade_count, 0, "GTA IV/Graphics/Shadows",
@@ -7870,6 +7871,10 @@ REXCVAR_DECLARE(bool, ps5_decoupled_presentation);
 REXCVAR_DECLARE(uint32_t, gta4_frame_limit);
 REXCVAR_DECLARE(std::string, gta4_native_frame_generation);
 REXCVAR_DECLARE(std::string, ps5_frame_generation);
+REXCVAR_DEFINE_BOOL(ps5_cutscene_30, true, "PS5",
+                    "Hold the game at 30 FPS during cutscenes and loading screens (the Xbox 360's rate): some "
+                    "missions' scripts, like Lure's rooftop, stall when they run faster");
+extern std::atomic<int64_t> g_ps5_loading_screen_ns;
 
 // [ps5 port] Frame generation's cadence at 120 Hz: 60 -> 120 (each image one
 // vblank) while the game and the renderer fit a frame in two vblanks, else
@@ -7943,7 +7948,7 @@ static void Ps5FrameGenerationCadence(int64_t now, int64_t work_ns, int64_t late
 // the schedule when it is a whole frame late), so a 40 ms frame is shown at
 // 40 ms, not at the next 33 ms slot after it. With frame generation the game
 // runs at half the TV's rate instead (a quarter while the cadence says so).
-static void Ps5LimitFrameRate() {
+static void Ps5LimitFrameRate(uint8_t* base) {
   if (!rex::frame_stats::g_title_thread.load(std::memory_order_relaxed)) {
     rex::frame_stats::g_title_thread.store(reinterpret_cast<uintptr_t>(pthread_self()),
                                            std::memory_order_relaxed);
@@ -7970,6 +7975,62 @@ static void Ps5LimitFrameRate() {
     const uint32_t refresh = gta4ps5::display::HighRefresh() ? 120 : 60;
     fps = refresh / (2 * std::max<uint32_t>(1, rex::frame_stats::g_fg_vblanks_per_image.load(std::memory_order_relaxed)));
   }
+  // [ps5 port] Cutscenes and loading screens at 30, as on the Xbox 360: in
+  // Lure, the cutscene on the rooftop ran on into an endless loading screen
+  // at 60 and 120 FPS (eight 1.0.1-1.0.2 reports), and went through at 30.
+  if (REXCVAR_GET(ps5_cutscene_30) && !rex::frame_stats::g_frame_generation_active.load(std::memory_order_relaxed)) {
+    constexpr uint32_t kCutsceneGlobal = 0x82B977F0;  // (gta4_sony_feedback.cpp's)
+    const int64_t loading_ns = g_ps5_loading_screen_ns.load(std::memory_order_relaxed);
+    const int64_t steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch())
+                                  .count();
+    const bool story = REX_LOAD_U32(kCutsceneGlobal) != 0 || (loading_ns && steady_ns - loading_ns < 500000000);
+    static bool was_story = false;
+    if (story != was_story) {
+      was_story = story;
+      REXLOG_INFO("ps5 frame limit: {}", story ? "30 FPS for a cutscene or loading screen" : "back to the limit");
+    }
+    if (story && (fps == 0 || fps > 30)) fps = 30;
+  }
+  // [ps5 port] Smooth Heavy Areas (ps5_smooth_40): at 120 Hz with a 60 limit,
+  // where a quarter of a second's frames run past 16.9 ms, an even 40 (three
+  // vblanks each) instead of 40-60 landing unevenly on the TV's 8.3 ms steps;
+  // back to 60 when 90% of 3 s of frames come in under 14 ms. Each frame's
+  // own time: from the end of the last one's hold to this call.
+  {
+    static bool at_40 = false;
+    static int64_t window_start = 0;
+    static uint32_t window_frames = 0, window_slow = 0, window_fast = 0;
+    const bool eligible = REXCVAR_GET(ps5_smooth_40) && fps == 60 && gta4ps5::display::HighRefresh() &&
+                          !rex::frame_stats::g_frame_generation_active.load(std::memory_order_relaxed);
+    if (eligible && last_exit_ns) {
+      const int64_t frame_ns = now - last_exit_ns;
+      ++window_frames;
+      if (frame_ns > 16900000) ++window_slow;
+      if (frame_ns < 14000000) ++window_fast;
+      if (!window_start) window_start = now;
+      if (now - window_start >= (at_40 ? 3000000000ll : 1000000000ll)) {
+        const bool next = at_40 ? window_fast * 100 < window_frames * 90 : window_slow * 4 >= window_frames;
+        if (next != at_40) {
+          at_40 = next;
+          REXLOG_INFO("ps5 frame limit: {}", at_40 ? "an even 40 for a busy area (Smooth Heavy Areas)"
+                                                    : "back to 60");
+        }
+        window_start = now;
+        window_frames = window_slow = window_fast = 0;
+      }
+    } else {
+      at_40 = false;
+      window_start = 0;
+      window_frames = window_slow = window_fast = 0;
+    }
+    const uint32_t effective = eligible && at_40 ? 40 : 0;
+    if (rex::frame_stats::g_effective_frame_limit.exchange(effective, std::memory_order_acq_rel) != effective) {
+      if (auto* changed = rex::frame_stats::g_display_pacing_changed.load(std::memory_order_acquire))
+        changed(effective ? "smooth heavy areas: 40" : "smooth heavy areas: 60");
+    }
+    if (effective) fps = effective;
+  }
   if (!fps) {
     next_ns = 0;
     leave();
@@ -7994,6 +8055,13 @@ static void Ps5LimitFrameRate() {
     }
     const uint64_t held_us = uint64_t(now - begin) / 1000;
     rex::frame_stats::g_pacer_wait_us.fetch_add(held_us, std::memory_order_relaxed);
+  } else if (gta4ps5::display::Vrr() && (fps == 60 || fps == 120) && now - next_ns > 1500000 &&
+             !rex::frame_stats::g_frame_generation_active.load(std::memory_order_relaxed)) {
+    // [ps5 port] With VRR, a late frame moves the schedule: the next one gets
+    // its whole frame time. Caught up instead, it went out right behind the
+    // late one, and the TV showed them for 25 ms and then 8 (1.0.3 Test 2's
+    // drive: 1 frame in 16 shown for one refresh, nearly all after a late one).
+    next_ns = now;
   }
   next_ns += period;
   leave();
@@ -8094,7 +8162,7 @@ extern "C" void sub_82A467D8(PPCContext& ctx, uint8_t* base) {
   g_last_present_frontbuffer.store(command.frontbuffer_texture, std::memory_order_relaxed);
   SubmitNativeCommand(command);
 #if REX_PLATFORM_PS5
-  Ps5LimitFrameRate();
+  Ps5LimitFrameRate(base);
 #endif
   ctx.r3.u32 = device;
 }

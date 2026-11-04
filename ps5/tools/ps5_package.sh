@@ -159,5 +159,11 @@ zlib=${ZLIB:-$tri/.deps/native/zlib/root/usr}
 make -s -C "$ps5dir/payload/installer" PS5_PAYLOAD_SDK="$sdk_root" ZLIB="$zlib"
 mkdir -p "$app/payloads"
 cp "$ps5dir/payload/installer/gta4-ps5-installer.elf" "$app/payloads/"
+# RecompTrophy's relay and watcher (ps5/payload/trophies, GPL-3.0, by lamarking,
+# used with permission): the game sends them to the loader to put its trophies
+# in the PS5's own list and show the PS5's trophy pop-ups.
+make -s -C "$ps5dir/payload/trophies" PS5_PAYLOAD_SDK="$sdk_root"
+cp "$ps5dir/payload/trophies/recomptrophy-relay.elf" "$ps5dir/payload/trophies/recomptrophy-watcher.elf" \
+    "$app/payloads/"
 "$tool" self --inspect --file "$app/eboot.bin" | tail -3
 echo "==> $app ($(stat -c %s "$app/eboot.bin") bytes)"

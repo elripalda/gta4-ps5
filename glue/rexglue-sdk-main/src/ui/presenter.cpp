@@ -292,7 +292,29 @@ void Presenter::FatalErrorHostGpuLossCallback([[maybe_unused]] bool is_responsib
   rex::FatalError("Graphics device lost (probably due to an internal error)");
 }
 
+#if REX_PLATFORM_PS5
+namespace {
+std::atomic<Presenter*> g_keepalive_presenter{nullptr};
+void KeepAlivePaint() {
+  if (Presenter* presenter = g_keepalive_presenter.load(std::memory_order_acquire))
+    presenter->RequestKeepAlivePaint();
+}
+}  // namespace
+
+void Presenter::RequestKeepAlivePaint() {
+  std::lock_guard<std::mutex> lock(paint_mode_mutex_);
+  if (paint_mode_ != PaintMode::kUIThreadOnRequest || !window_ || !surface_) return;
+  keepalive_requested_.store(true, std::memory_order_release);
+  RequestPaintOrConnectionRecoveryViaWindow(true);
+}
+#endif
+
 Presenter::~Presenter() {
+#if REX_PLATFORM_PS5
+  Presenter* self = this;
+  if (g_keepalive_presenter.compare_exchange_strong(self, nullptr))
+    rex::frame_stats::g_request_keepalive_paint.store(nullptr, std::memory_order_release);
+#endif
   CancelFramePacingWaits();
   // No intrusive lifetime management must be performed from UI drawers - defer
   // it if needed.
@@ -537,6 +559,31 @@ void Presenter::PaintFromUIThreadImpl(bool force_paint, bool display_opportunity
       // doesn't limit the frame rate.
       WaitForUITickFromUIThread();
 
+#if REX_PLATFORM_PS5
+      // [ps5 port] While the game is publishing frames, the UI thread paints
+      // only to show a new one. A repaint asked for by an overlay (the trophy
+      // popup asked at every paint until 1.1) sent the frame already on the
+      // TV again: ~50 repeats a second at 60 FPS, each a flip that a new frame
+      // then waited behind, landing it a vblank early or late. The overlays
+      // are drawn with the next game frame instead (ui_paint_pending_ stays
+      // set); if none comes within 100 ms (the game stopped), this paint goes
+      // ahead then, so the UI never freezes.
+      if (g_keepalive_presenter.load(std::memory_order_relaxed) != this) {
+        g_keepalive_presenter.store(this, std::memory_order_release);
+        rex::frame_stats::g_request_keepalive_paint.store(&KeepAlivePaint, std::memory_order_release);
+      }
+      const bool keepalive = keepalive_requested_.exchange(false, std::memory_order_acq_rel);
+      const uint64_t last_frame_ns = last_active_publication_ns_.load(std::memory_order_relaxed);
+      const uint64_t paint_now_ns = FramePacerNowNs();
+      if (keepalive && !publication_progress_.pending())
+        rex::frame_stats::g_keepalive_paints.fetch_add(1, std::memory_order_relaxed);
+      if (!force_paint && !keepalive && !publication_progress_.pending() && last_frame_ns &&
+          paint_now_ns >= last_frame_ns && paint_now_ns - last_frame_ns < 100'000'000ull &&
+          !rex::frame_stats::g_frame_generation_active.load(std::memory_order_relaxed)) {
+        rex::frame_stats::g_repeat_paints_skipped.fetch_add(1, std::memory_order_relaxed);
+        window_->RequestPaintAfterNanoseconds(100'000'000ull);
+      } else
+#endif
       paint_result = PaintAndPresent(draw_ui);
       if (paint_result == PaintResult::kPresented || paint_result == PaintResult::kPresentedSuboptimal)
         ui_paint_pending_ = false;
@@ -730,6 +777,9 @@ bool Presenter::RefreshGuestOutput(
                 probe.guest_image, probe.guest_version, published_mailbox_index, probe.native_submission);
   }
   publication_progress_.Publish(publication_serial);
+#if REX_PLATFORM_PS5
+  if (is_active) last_active_publication_ns_.store(FramePacerNowNs(), std::memory_order_relaxed);
+#endif
   // Trigger the presentation on the host.
   PaintResult paint_result = PaintResult::kNotPresented;
   PaintMode paint_mode_snapshot = PaintMode::kNone;

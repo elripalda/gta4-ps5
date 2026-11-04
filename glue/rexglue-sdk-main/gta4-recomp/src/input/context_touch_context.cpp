@@ -281,7 +281,7 @@ bool RuntimeRead(void* opaque, uint32_t address, void* output, size_t size) {
   const auto last = static_cast<uint32_t>(uint64_t{address} + size - 1);
   if (!heap || heap != memory->LookupHeap(last)) return false;
   using rex::memory::PageAccess;
-  const auto access = heap->QueryRangeAccess(address, last);
+  const auto access = heap->QueryRangeAccessUnlocked(address, last);
   if (access != PageAccess::kReadOnly && access != PageAccess::kExecuteReadOnly &&
       access != PageAccess::kReadWrite && access != PageAccess::kExecuteReadWrite) return false;
   std::memcpy(output, base + address + REX_PHYS_HOST_OFFSET(address), size);
@@ -311,7 +311,7 @@ uint32_t QueryVehicleEntry(void* opaque, uint32_t ped, uint32_t forward) {
   const uint32_t stack = original_sp - kCallerFrame;
   auto* heap = memory ? memory->LookupHeap(stack) : nullptr;
   if (!heap || heap != memory->LookupHeap(original_sp - 1)) return 0;
-  const auto access = heap->QueryRangeAccess(stack, original_sp - 1);
+  const auto access = heap->QueryRangeAccessUnlocked(stack, original_sp - 1);
   using rex::memory::PageAccess;
   if (access != PageAccess::kReadWrite && access != PageAccess::kExecuteReadWrite) return 0;
   ScopedVehicleQueryContext scope(query.parent);

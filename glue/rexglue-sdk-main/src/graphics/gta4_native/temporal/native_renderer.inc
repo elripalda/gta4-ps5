@@ -343,10 +343,27 @@ void Gta4NativeGraphicsSystem::ClassifyTemporalDraw(const NativeCommand& command
        IsFusionSkyShader(command.pipeline_state->pixel_shader_resource->hash)));
   if (policy.motion_relevant && (target.color_write_mask || fixed.depth_write_enable) &&
       ((!target.temporal_motion && !preserves) || (target.temporal_motion && !target.temporal_jitter))) {
+#if REX_PLATFORM_PS5
+    // [ps5 port] Two kinds of draw no longer cost the frame its generated
+    // twin: one with motion but drawn without the frame's jitter (gta_default
+    // vs4: at most a sub-pixel shimmer on it), and one with no motion that
+    // writes no depth (hair's sorted alpha: drawn as reactive, like the sky).
+    // Every frame had one, so frame generation never made a frame.
+    const bool tolerated = target.temporal_motion || (target.temporal_reactive && !fixed.depth_write_enable);
+    if (tolerated) {
+      NOTE_FG_MOTION_LOST(target.temporal_motion ? "motion without jitter, tolerated"
+                                                 : "no motion, no depth, tolerated",
+                          command.pipeline_state);
+    } else {
+      if (temporal_motion_complete_) NOTE_FG_MOTION_LOST("no motion, not blended", command.pipeline_state);
+      temporal_motion_complete_ = false;
+    }
+#else
     if (temporal_motion_complete_)
       NOTE_FG_MOTION_LOST(!target.temporal_motion ? "no motion, not blended" : "motion without jitter",
                           command.pipeline_state);
     temporal_motion_complete_ = false;
+#endif
   }
 }
 
@@ -577,6 +594,31 @@ bool Gta4NativeGraphicsSystem::ReplayTemporalDisplayDraw(VkCommandBuffer cb,
       temporal_ui_exact_ = temporal_display_ready_ = false; return true;
     }
   }
+#if REX_PLATFORM_PS5
+  // [ps5 port] A HUD draw that blends with the alpha already on the screen
+  // (the radar: its mask shapes write alpha, the map is drawn through it).
+  // The replay's target starts and keeps its alpha differently from the
+  // game's 8-bit backbuffer (float, cleared to 0, later clears not mirrored),
+  // so such a frame is shown as the game drew it, without a generated twin:
+  // frame generation broke the radar (1.0.1).
+  if (!composite && REXCVAR_GET(ps5_fg_hud_alpha_guard)) {
+    const uint32_t packed = command.fixed_function_state.blend_controls[0];
+    if (IsNativeBlendControlEnabled(packed)) {
+      const NativeBlendControlState blend = DecodeNativeBlendControl(packed);
+      const auto reads_alpha = [](uint32_t f) { return f == 10 || f == 11 || f == 16; };
+      const auto reads_any = [](uint32_t f) { return (f >= 8 && f <= 11) || f == 16; };
+      if (reads_alpha(blend.source_color) || reads_alpha(blend.destination_color) ||
+          reads_any(blend.source_alpha) || reads_any(blend.destination_alpha)) {
+        static std::atomic<uint32_t> noted{0};
+        if (noted.fetch_add(1, std::memory_order_relaxed) < 4)
+          REXLOG_INFO("ps5 frame generation: a HUD draw blends with the screen's alpha (blend {:08X}): that "
+                      "frame shown as drawn", packed);
+        temporal_ui_exact_ = temporal_display_ready_ = false;
+        return true;
+      }
+    }
+  }
+#endif
   if (!ReplayTemporalDraw(cb, command, original, resources, temporal_scene_.display(), composite)) {
     temporal_ui_exact_ = temporal_display_ready_ = false;
     return true;
@@ -688,7 +730,7 @@ bool Gta4NativeGraphicsSystem::EncodeTemporalGeneration(VkCommandBuffer cb) {
     rex::frame_stats::NoteFgDrop(rex::frame_stats::FgDrop::kSecondComposite);
     return true;
   }
-  const auto selected = rex::cvar::GetFlagByName("gta4_native_frame_generation");
+  const auto selected = CachedFlagByName("gta4_native_frame_generation");
   if (selected != "fsr3" && selected != "dlss") return true;
   if (!temporal_encoded_ || !temporal_motion_complete_ || !temporal_camera_adopted_ ||
       temporal_presenter_acquired_) {

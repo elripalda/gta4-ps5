@@ -59,23 +59,47 @@ GameOverlay::~GameOverlay() {
 }
 
 void GameOverlay::Sample() {
-  const int64_t now = rex::frame_stats::NowNs();
-  const uint64_t frames = rex::frame_stats::g_presents.load(std::memory_order_acquire);
+  using namespace rex::frame_stats;
+  const int64_t now = NowNs();
+  const uint64_t frames = g_presents.load(std::memory_order_acquire);
+  const uint64_t tv = g_tv_shown.load(std::memory_order_acquire);
   const int64_t span = now - window_start_ns_;
   if (span < 500'000'000) return;
   const uint64_t n = frames - window_frames_;
-  fps_ = float(double(n) * 1e9 / double(span));
-  ms_ = n ? float(double(span) / 1e6 / double(n)) : 0.0f;
+  const uint64_t shown = tv - window_tv_;
+  game_fps_ = float(double(n) * 1e9 / double(span));
+  // [ps5 port] What the TV showed when the pacing thread sees it: the game can
+  // finish 60 frames a second while some stay up for two refreshes and others
+  // never reach the screen, which the game's own count reads as a clean 60.
+  from_tv_ = shown > 0;
+  const uint64_t counted = from_tv_ ? shown : n;
+  fps_ = float(double(counted) * 1e9 / double(span));
+  ms_ = counted ? float(double(span) / 1e6 / double(counted)) : 0.0f;
   window_start_ns_ = now;
   window_frames_ = frames;
+  window_tv_ = tv;
   // the slowest frames of the last few seconds: 1% low and the worst one
-  const uint32_t count = uint32_t(std::min<uint64_t>(frames > 1 ? frames - 1 : 0, rex::frame_stats::kHistory));
   std::vector<uint32_t> times;
-  times.reserve(count);
-  for (uint32_t i = 0; i < count; ++i) {
-    const uint32_t us = rex::frame_stats::g_history_us[(frames - 1 - i) % rex::frame_stats::kHistory].load(
-        std::memory_order_relaxed);
-    if (us) times.push_back(us);
+  if (from_tv_) {
+    const uint32_t count = uint32_t(std::min<uint64_t>(tv, 300));
+    times.reserve(count);
+    for (uint32_t i = 0; i < count; ++i)
+      if (const uint32_t us = g_tv_hold_us[(tv - 1 - i) % kTvHistory].load(std::memory_order_relaxed))
+        times.push_back(us);
+  } else {
+    const uint32_t count = uint32_t(std::min<uint64_t>(frames > 1 ? frames - 1 : 0, kHistory));
+    times.reserve(count);
+    for (uint32_t i = 0; i < count; ++i)
+      if (const uint32_t us = g_history_us[(frames - 1 - i) % kHistory].load(std::memory_order_relaxed))
+        times.push_back(us);
+  }
+  // a stutter: a frame on screen half again as long as the usual one
+  stutters_ = 0;
+  if (from_tv_ && times.size() >= 30) {
+    std::vector<uint32_t> sorted = times;
+    std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+    const uint32_t usual = sorted[sorted.size() / 2];
+    for (const uint32_t us : times) stutters_ += us > usual + usual / 2 && us > usual + 5000;
   }
   if (times.empty()) {
     low_fps_ = worst_ms_ = 0;
@@ -136,7 +160,11 @@ void GameOverlay::OnDraw(ImGuiIO& io) {
   std::vector<std::string> info;
   if (!simple) {
     // what the picture is: the game's resolution, the TV, the frame limit
-    std::string res = rex::cvar::GetFlagByName("resolution");
+    if (!resolution_at_ns_ || rex::frame_stats::NowNs() - resolution_at_ns_ > 1'000'000'000) {
+      resolution_ = rex::cvar::GetFlagByName("resolution");
+      resolution_at_ns_ = rex::frame_stats::NowNs();
+    }
+    std::string res = resolution_;
     if (res == "4k") res = "4K";
     std::string tv = display::HighRefresh() ? (display::Vrr() ? "120 Hz VRR" : "120 Hz") : "60 Hz";
     const bool fg = rex::frame_stats::g_frame_generation_active.load(std::memory_order_relaxed);
@@ -148,6 +176,8 @@ void GameOverlay::OnDraw(ImGuiIO& io) {
       info.push_back("Frame generation " + std::to_string(out / 2) + " \xE2\x86\x92 " + std::to_string(out));
     }
     // the renderer's share of the last frame (the graphics thread's recording)
+    if (from_tv_) info.push_back(fmt::format("Game {:.0f} FPS  \xC2\xB7  {} stutter{}", game_fps_, stutters_,
+                                              stutters_ == 1 ? "" : "s"));
     if (const uint32_t rec = rex::frame_stats::g_last_recorder_busy_us.load(std::memory_order_relaxed))
       info.push_back("Renderer " + fmt::format("{:.1f}", rec / 1000.0) + " ms a frame");
   }
@@ -179,17 +209,21 @@ void GameOverlay::OnDraw(ImGuiIO& io) {
     dl->AddText(body, 14 * s, P(x + pad, y + pad + 37 + 20 + float(i) * line_h), IM_COL32(255, 255, 255, 175),
                 info[i].c_str());
 
-  // the graph: one bar a frame, newest on the right, 0 to 66 ms (15 FPS) tall
+  // the graph: one bar a frame (as the TV showed them, when known), newest
+  // on the right, 0 to 66 ms (15 FPS) tall
   const float gx = x + pad, gy = y + pad + 36 + 20 + float(info.size()) * line_h + 10, gw = w - pad * 2;
   dl->AddRectFilled(P(gx, gy), P(gx + gw, gy + graph_h), IM_COL32(255, 255, 255, 18), 4 * s);
   constexpr float kTopMs = 66.7f;
-  const uint64_t frames = rex::frame_stats::g_presents.load(std::memory_order_acquire);
+  const uint64_t frames = from_tv_ ? rex::frame_stats::g_tv_shown.load(std::memory_order_acquire)
+                                   : rex::frame_stats::g_presents.load(std::memory_order_acquire);
   constexpr int kBars = 120;
   const float bar = gw / float(kBars);
   for (int i = 0; i < kBars && uint64_t(i) + 1 < frames; ++i) {
     const uint32_t us =
-        rex::frame_stats::g_history_us[(frames - 1 - uint64_t(i)) % rex::frame_stats::kHistory].load(
-            std::memory_order_relaxed);
+        from_tv_ ? rex::frame_stats::g_tv_hold_us[(frames - 1 - uint64_t(i)) % rex::frame_stats::kTvHistory].load(
+                       std::memory_order_relaxed)
+                 : rex::frame_stats::g_history_us[(frames - 1 - uint64_t(i)) % rex::frame_stats::kHistory].load(
+                       std::memory_order_relaxed);
     if (!us) continue;
     const float f_ms = float(us) / 1000.0f;
     const float bh = graph_h * std::min(f_ms, kTopMs) / kTopMs;

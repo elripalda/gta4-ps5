@@ -57,7 +57,7 @@ bool GuestSpan(uint8_t* base, uint32_t address, std::size_t size, bool writable 
   auto* heap = memory ? memory->LookupHeap(address) : nullptr;
   if (!heap || heap != memory->LookupHeap(static_cast<uint32_t>(last)))
     return false;
-  const auto access = heap->QueryRangeAccess(address, static_cast<uint32_t>(last));
+  const auto access = heap->QueryRangeAccessUnlocked(address, static_cast<uint32_t>(last));
   using rex::memory::PageAccess;
   return access == PageAccess::kReadWrite || access == PageAccess::kExecuteReadWrite ||
          (!writable && (access == PageAccess::kReadOnly || access == PageAccess::kExecuteReadOnly));

@@ -43,7 +43,7 @@ bool RadarSpan(uint8_t* base, uint32_t address, size_t size, bool write = false)
   auto* heap = memory ? memory->LookupHeap(address) : nullptr;
   const uint32_t last = uint32_t(uint64_t(address) + size - 1);
   if (!heap || heap != memory->LookupHeap(last)) return false;
-  const auto access = heap->QueryRangeAccess(address, last);
+  const auto access = heap->QueryRangeAccessUnlocked(address, last);
   using rex::memory::PageAccess;
   return access == PageAccess::kReadWrite || access == PageAccess::kExecuteReadWrite ||
       (!write && (access == PageAccess::kReadOnly || access == PageAccess::kExecuteReadOnly));

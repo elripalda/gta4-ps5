@@ -1928,6 +1928,31 @@ rex::memory::PageAccess BaseHeap::QueryRangeAccess(uint32_t low_address, uint32_
   }
 }
 
+rex::memory::PageAccess BaseHeap::QueryRangeAccessUnlocked(uint32_t low_address,
+                                                           uint32_t high_address) const {
+  if (low_address > high_address || low_address < heap_base_ ||
+      (high_address - heap_base_) >= heap_size_) {
+    return rex::memory::PageAccess::kNoAccess;
+  }
+  const uint32_t low_page_number = (low_address - heap_base_) >> page_size_shift_;
+  const uint32_t high_page_number = (high_address - heap_base_) >> page_size_shift_;
+  bool all_readable = true;
+  bool all_writable = true;
+  for (uint32_t i = low_page_number; i <= high_page_number; ++i) {
+    PageEntry entry;
+    entry.qword = __atomic_load_n(&page_table_[i].qword, __ATOMIC_RELAXED);
+    const uint32_t page_protect = entry.current_protect;
+    if (!(page_protect & memory::kMemoryProtectRead)) all_readable = false;
+    if (!(page_protect & memory::kMemoryProtectWrite) &&
+        !(page_protect & memory::kMemoryProtectWriteCombine)) {
+      all_writable = false;
+    }
+  }
+  if (all_readable && all_writable) return rex::memory::PageAccess::kReadWrite;
+  if (all_readable) return rex::memory::PageAccess::kReadOnly;
+  return rex::memory::PageAccess::kNoAccess;
+}
+
 VirtualHeap::VirtualHeap() = default;
 
 VirtualHeap::~VirtualHeap() = default;

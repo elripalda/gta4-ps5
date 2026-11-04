@@ -145,6 +145,21 @@ void FillTrigger(ScePadTriggerEffectCommand& c, const rex::input::sony::TriggerF
     case Feel::kRecoil:
       c.mode = 3, c.data[0] = 2, c.data[1] = Level(feel.strength, 2, 8), c.data[2] = 40;
       break;
+    // (the mode and its parameters as given: Service::Compose's guns and driving)
+    case Feel::kFeedback:
+      c.mode = 1, c.data[0] = std::min<uint8_t>(feel.a, 9), c.data[1] = std::clamp<uint8_t>(feel.b, 1, 8);
+      break;
+    case Feel::kWeapon: {
+      const uint8_t start = std::clamp<uint8_t>(feel.a, 2, 7);
+      c.mode = 2, c.data[0] = start, c.data[1] = std::clamp<uint8_t>(feel.b, uint8_t(start + 1), 8),
+      c.data[2] = std::min<uint8_t>(feel.c, 8);
+      break;
+    }
+    case Feel::kVibration:
+      if (!feel.b) break;
+      c.mode = 3, c.data[0] = std::min<uint8_t>(feel.a, 9), c.data[1] = std::min<uint8_t>(feel.b, 8),
+      c.data[2] = feel.c;
+      break;
     default: break;  // (mode 0: off)
   }
 }

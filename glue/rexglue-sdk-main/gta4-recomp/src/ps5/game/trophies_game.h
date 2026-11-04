@@ -38,6 +38,11 @@ class TrophyPopup final : public rex::ui::AchievementNotificationDialog {
 
   // (from the thread that unlocked it)
   void Push(const rex::system::AchievementEvent& event) override;
+  // [ps5 port] Only while a card is up. The default (always) had the screen
+  // redrawn at every vblank for the whole session: the frame on the TV sent
+  // again ~50 times a second, new frames waiting behind those repeats and
+  // landing one vblank early or late (1.1's logs: "TV 110 fps" at 60 FPS).
+  bool WantsContinuousRepaint() const override;
 
  protected:
   void OnDraw(ImGuiIO& io) override;
@@ -56,7 +61,7 @@ class TrophyPopup final : public rex::ui::AchievementNotificationDialog {
   rex::ui::AchievementIconCache icons_;
   std::unique_ptr<rex::ui::ImmediateTexture> title_picture_;
   bool title_picture_tried_ = false;
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
   std::deque<Card> queue_;
 };
 

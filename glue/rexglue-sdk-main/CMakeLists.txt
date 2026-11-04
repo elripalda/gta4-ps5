@@ -139,8 +139,13 @@ endif()
 # and FP-exception awareness, which blocks reordering and vectorization of the
 # renderer's float code; guest FP semantics live in the generated code, which
 # never had it. Contract off still forbids fusing into FMA.
+# [ps5 port] 1.0.3 Test 2: the PS5 the same way (it had strict everywhere,
+# the recompiled game's code included; its render and game threads are
+# CPU-bound).
 if(ANDROID)
     add_compile_options(-ffp-contract=off $<$<CONFIG:RELWITHDEBINFO>:-O3>)
+elseif(PS5)
+    add_compile_options(-ffp-contract=off)
 else()
     add_compile_options(-ffp-model=strict)
 endif()

@@ -149,7 +149,9 @@ struct Audio {
 // The pages, in the order of the top bar. Display, Game and Debug are the
 // settings, by section. Debug is shown only with the debug options (Hub's
 // debug_options_).
-enum Tab { kHome, kDisplayTab, kGameTab, kEpisodesTab, kSavesTab, kTrophiesTab, kAboutTab, kDebugTab, kTabCount };
+// [ps5 port] 1.1: the Trophies tab is no longer shown (its trophies are read
+// from the game by a separate PS5 app); it stays last, after Debug.
+enum Tab { kHome, kDisplayTab, kGameTab, kEpisodesTab, kSavesTab, kAboutTab, kDebugTab, kTrophiesTab, kTabCount };
 
 class Hub {
  public:
@@ -274,7 +276,7 @@ class Hub {
   float about_hold_ = 0;         // how long Cross has been held on About
   bool about_hold_done_ = false;  // (switched: not again until it's let go)
   static constexpr float kUnlockHold = 3, kUnlockShow = 0.6f;
-  int TabsShown() const { return debug_options_ ? kTabCount : kDebugTab; }  // (Debug is the last)
+  int TabsShown() const { return debug_options_ ? kDebugTab + 1 : kDebugTab; }  // (Debug the last shown)
   bool Shown(const Setting& r) const;
   void KeepHiddenSettings();
   void SetDebugOptions(bool on);

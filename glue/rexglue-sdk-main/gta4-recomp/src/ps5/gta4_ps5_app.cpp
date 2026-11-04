@@ -13,6 +13,7 @@
 #include <rex/system/flags.h>
 
 #include "../gta4_app.h"
+#include "trophies_native/native_trophies.h"
 #include "game/ps5_display.h"
 #include "game/ps5_overlay.h"
 #include "game/save_import.h"
@@ -89,6 +90,8 @@ void ShowHub(rex::ui::ImGuiDrawer* drawer, rex::ui::ImmediateDrawer* immediate, 
 
 void OnGameSetUp(rex::ui::ImGuiDrawer* drawer, rex::Runtime* runtime, const fs::path& user_data) {
   WriteTrophyCatalog(runtime, user_data);
+  // (the game's PS5 trophy set and pop-ups, on a thread of its own)
+  StartNativeTrophies(runtime, user_data);
   g_overlay = std::make_unique<GameOverlay>(drawer);
 }
 
@@ -96,8 +99,10 @@ void OnGameSetUp(rex::ui::ImGuiDrawer* drawer, rex::Runtime* runtime, const fs::
 
 void GTA4App::OnConfigureFonts(ImFontAtlas* atlas) { gta4ps5::hub::ConfigureFonts(atlas); }
 
+// [ps5 port] 1.1: no trophy popup in the game: the PS5 shows its own
+// (trophies_native/native_trophies.h). Trophies are still earned and recorded as before.
 std::unique_ptr<rex::ui::AchievementNotificationDialog> GTA4App::CreateAchievementNotificationDialog() {
-  return std::make_unique<gta4ps5::TrophyPopup>(imgui_drawer(), immediate_drawer(), runtime());
+  return nullptr;
 }
 
 #endif  // REX_PLATFORM_PS5

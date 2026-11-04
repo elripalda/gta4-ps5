@@ -57,6 +57,10 @@ struct GameState {
   int episode = 0;
   int wanted = 0;
   TriggerContext trigger_context = TriggerContext::kNone;
+  // GTA IV's weapon slot (2 handgun, 3 shotgun, 4 SMG, 5 rifle, 6 sniper,
+  // 7 heavy, 8 thrown) and how fast the player (or their vehicle) moves, m/s.
+  int weapon_slot = 0;
+  float speed = 0;
   uint32_t player_identity = 0;
   uint32_t context_identity = 0;
 };
@@ -66,10 +70,15 @@ using EffectPacket = std::array<uint8_t, 47>;
 // What a trigger's effect is for, with its strength (0..1), alongside the
 // DualSense report bytes: a driver with the console's own trigger modes (the
 // PS5's scePadSetTriggerEffect) picks the mode that feels like it.
+// kFeedback/kWeapon/kVibration name the console's mode directly, with its
+// parameters in a, b, c: feedback (position 0-9, strength 1-8), weapon (start
+// 2-7, end start+1..8, strength 0-8), vibration (position 0-9, amplitude 0-8,
+// frequency Hz).
 struct TriggerFeel {
-  enum Kind : uint8_t { kOff, kPedal, kAim, kGun, kRecoil };
+  enum Kind : uint8_t { kOff, kPedal, kAim, kGun, kRecoil, kFeedback, kWeapon, kVibration };
   Kind kind = kOff;
   float strength = 0;
+  uint8_t a = 0, b = 0, c = 0;
   bool operator==(const TriggerFeel&) const = default;
 };
 struct Output {
@@ -115,6 +124,11 @@ class Service {
   };
   struct PendingGesture { Gesture gesture; uint64_t timestamp; };
   struct Pulse { uint64_t until_ms = 0; float strength = 0; };
+  struct Shots {
+    uint64_t last_ms = 0;
+    float interval_ms = 0;  // between the last shots (0: one shot)
+    int slot = 0;           // the weapon slot that fired
+  };
   struct Slot {
     Device device{};
     GameState game{};
@@ -128,6 +142,9 @@ class Service {
     bool multi_touch = false;
     uint64_t multi_started_ms = 0;
     std::array<Pulse, 3> pulses{};
+    Shots shots{};
+    uint64_t shot_rumble_until_ms = 0;
+    float shot_low = 0, shot_high = 0;
   };
   static bool Fresh(const Slot& slot, uint64_t now_ms);
   static void Cancel(Slot& slot);

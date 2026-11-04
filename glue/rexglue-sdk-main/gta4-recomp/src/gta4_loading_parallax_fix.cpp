@@ -1,6 +1,7 @@
 #include "gta4_loading_parallax_fix.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <bit>
 #include <cstdint>
@@ -47,7 +48,19 @@ void StoreGuestFloat(uint8_t* base, uint32_t address, float value) {
 
 }  // namespace
 
+#if REX_PLATFORM_PS5
+// [ps5 port] When a loading screen was last drawn (the frame limiter holds
+// the game at 30 FPS while one is up: gta4_native_hooks.cpp).
+std::atomic<int64_t> g_ps5_loading_screen_ns{0};
+#endif
+
 extern "C" void sub_82143DC8(PPCContext& ctx, uint8_t* base) {
+#if REX_PLATFORM_PS5
+  g_ps5_loading_screen_ns.store(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+          .count(),
+      std::memory_order_relaxed);
+#endif
   const uint32_t screen = REX_LOAD_U32(kCurrentScreenGlobal);
   if (screen >= kScreenCount) {
     __imp__sub_82143DC8(ctx, base);

@@ -61,7 +61,7 @@ bool GuestSpan(uint8_t* base, uint32_t address, size_t size, bool writable = fal
   auto* memory = kernel ? kernel->memory() : nullptr;
   auto* heap = memory ? memory->LookupHeap(address) : nullptr;
   if (!heap || heap != memory->LookupHeap(static_cast<uint32_t>(last))) return false;
-  const auto access = heap->QueryRangeAccess(address, static_cast<uint32_t>(last));
+  const auto access = heap->QueryRangeAccessUnlocked(address, static_cast<uint32_t>(last));
   using rex::memory::PageAccess;
   return access == PageAccess::kReadWrite || access == PageAccess::kExecuteReadWrite ||
          (!writable && (access == PageAccess::kReadOnly || access == PageAccess::kExecuteReadOnly));
@@ -149,14 +149,18 @@ void ReadAliased(PPCContext&, uint8_t* base) {
 #if !defined(GTA4_SONY_LEGACY_HOST)
   title_owned = GTA4_TouchTitleInputOwned();
 #endif
+  // [ps5 port] The phone only takes the touchpad and the gun: driving with it
+  // up kept the pedals' adaptive triggers and the added rumble off (the
+  // phone counted as a menu for all of it).
+  const bool phone = PhoneVisible(base);
   state.active = gta4::sony::GameplayOwned(
       playing, REX_LOAD_U32(info + 1200), REX_LOAD_U32(kGameMode) == 1,
-      REX_LOAD_U32(ped + 2496), FrontendActive(base), PhoneVisible(base),
+      REX_LOAD_U32(ped + 2496), FrontendActive(base), false,
       REX_LOAD_U32(kMinigame) != 0, title_owned || REX_LOAD_U32(kCutscene) != 0);
-  state.gestures_owned = state.active;
+  state.gestures_owned = state.active && !phone;
   const uint32_t aim = kGameplayControl + kActionArray + 6 * kActionStride;
-  state.aiming = state.active && rex::input::mnk::DecodeActionMagnitude(
-                                    REX_LOAD_U8(aim), REX_LOAD_U8(aim + 2)) > 127;
+  state.aiming = state.gestures_owned && rex::input::mnk::DecodeActionMagnitude(
+                                             REX_LOAD_U8(aim), REX_LOAD_U8(aim + 2)) > 127;
 
   // Checked equivalent of sub_823D4D60: both object+600 and manager+32
   // contain pointers, not inline CWeapon structures. Unarmed/special fallback
@@ -172,8 +176,9 @@ void ReadAliased(PPCContext&, uint8_t* base) {
       // continuing shot. Other states are rejected even with rounds left in
       // the clip, so partial-clip reloads must release trigger resistance too.
       const uint32_t weapon_state = REX_LOAD_U32(weapon + 24);
-      state.can_fire = state.active && REX_LOAD_U16(weapon + 28) != 0 &&
+      state.can_fire = state.gestures_owned && REX_LOAD_U16(weapon + 28) != 0 &&
                        (weapon_state == 0 || weapon_state == 1);
+      state.weapon_slot = static_cast<int>(slot);
     }
   }
   if (state.active && state.in_vehicle && state.driver) {
@@ -182,11 +187,13 @@ void ReadAliased(PPCContext&, uint8_t* base) {
     state.trigger_context = sony::TriggerContext::kWeapon;
   }
 
-  // Entity position selection in sub_822343C0: matrix+48 or inline+16.
-  const uint32_t matrix = REX_LOAD_U32(ped + 32);
+  // Entity position selection in sub_822343C0: matrix+48 or inline+16 (the
+  // vehicle's when in one: its speed drives the pedals' feel).
+  const uint32_t entity = state.in_vehicle ? player.vehicle : ped;
+  const uint32_t matrix = REX_LOAD_U32(entity + 32);
   uint32_t position = 0;
   if (matrix && GuestSpan(base, matrix, 60)) position = matrix + 48;
-  if (!matrix) position = ped + 16;
+  if (!matrix) position = entity + 16;
   if (position) {
     player.position_valid = true;
     for (size_t axis = 0; axis < player.position.size(); ++axis) {
@@ -259,10 +266,44 @@ uint64_t poll_sequence = 0;
 
 }  // namespace
 
+// How fast the local player (or their vehicle) moves, from its position at each
+// poll, smoothed; a jump of more than 50 m (a teleport, a respawn) starts over.
+static float Speed(const GTA4SonyLocalPlayer& player, bool valid, uint64_t now_ms) {
+  static std::mutex mutex;
+  static std::array<float, 3> last{};
+  static uint64_t last_ms = 0;
+  static uint32_t last_context = 0;
+  static float speed = 0;
+  std::lock_guard lock(mutex);
+  if (!valid || !player.position_valid) {
+    last_ms = 0;
+    return speed = 0;
+  }
+  const float dt = last_ms && now_ms > last_ms ? float(now_ms - last_ms) / 1000.0f : 0.0f;
+  if (dt > 0.0f && dt < 0.010f) return speed;  // (the same frame polled twice)
+  float distance = 0;
+  for (size_t axis = 0; axis < 3; ++axis) {
+    const float d = player.position[axis] - last[axis];
+    distance += d * d;
+  }
+  distance = std::sqrt(distance);
+  if (dt <= 0.0f || dt > 0.5f || distance > 50.0f ||
+      last_context != player.state.context_identity) {
+    speed = 0;
+  } else {
+    speed = speed * 0.7f + (distance / dt) * 0.3f;
+  }
+  last = player.position;
+  last_ms = now_ms;
+  last_context = player.state.context_identity;
+  return speed;
+}
+
 void GTA4_SonyEndPoll(PPCContext& context, uint8_t* base) {
-  const auto snapshot = ReadSnapshot(context, base);
+  auto snapshot = ReadSnapshot(context, base);
   const auto options = sony::GetOptions();
   const uint64_t now = SDL_GetTicks();
+  snapshot.player.state.speed = Speed(snapshot.player, snapshot.valid, now);
   std::array<sony::Input, 4> input;
   for (uint32_t user = 0; user < input.size(); ++user) {
     input[user] = sony::GetService().Consume(user, now, options);

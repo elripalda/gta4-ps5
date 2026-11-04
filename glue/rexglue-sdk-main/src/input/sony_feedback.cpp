@@ -15,7 +15,54 @@ float Unit(float value) {
   return std::isfinite(value) ? std::clamp(value, 0.0f, 1.0f) : 0.0f;
 }
 uint16_t Motor(float value) { return static_cast<uint16_t>(Unit(value) * 65535.0f); }
-uint8_t Force(float value) { return static_cast<uint8_t>(Unit(value) * 110.0f); }
+
+// GTA IV's guns by weapon slot. Ready to fire, the trigger has a wall that
+// gives way (weapon mode: where it starts and ends, how hard); a single shot
+// kicks it (vibration: amplitude, Hz, how long); held automatic fire knocks
+// it once a round (its frequency the measured rate of fire). Each shot also
+// shakes the controller (low and high motors, how long).
+struct GunFeel {
+  uint8_t start = 0, end = 0, strength = 0;  // the trigger before a shot
+  uint8_t aim = 0;                           // L2 while aiming (feedback)
+  uint8_t kick = 0, kick_hz = 0;             // a single shot's kick (0 Hz: 30)
+  uint16_t kick_ms = 0;
+  float low = 0, high = 0;                   // the body rumble of a shot
+  uint16_t rumble_ms = 0;
+};
+constexpr std::array<GunFeel, 10> kGuns{{
+    {},                                          // 0 unarmed
+    {},                                          // 1 melee
+    {3, 5, 5, 2, 8, 30, 70, 0.30f, 0.70f, 70},   // 2 handgun: light take-up, crisp break
+    {3, 6, 8, 3, 8, 18, 130, 1.00f, 0.80f, 150}, // 3 shotgun: heavy, a deep thump
+    {2, 4, 3, 2, 6, 0, 45, 0.18f, 0.50f, 45},    // 4 SMG: light, rattles while held
+    {3, 5, 4, 3, 7, 0, 55, 0.28f, 0.60f, 55},    // 5 rifle
+    {4, 6, 8, 4, 8, 22, 140, 0.90f, 0.95f, 170}, // 6 sniper: heavy, one big kick
+    {4, 7, 8, 5, 8, 14, 220, 1.00f, 0.70f, 300}, // 7 heavy: rockets
+    {2, 3, 2, 1, 0, 0, 0, 0.00f, 0.00f, 0},      // 8 thrown: a light pull
+    {},                                          // 9 special
+}};
+const GunFeel& Gun(int slot) { return kGuns[size_t(std::clamp(slot, 0, 9))]; }
+
+// The console's trigger modes as DualSense report bytes, for the drivers that
+// send those (the PS5's reads TriggerFeel itself).
+Trigger Report(const TriggerFeel& feel) {
+  Trigger result{};
+  switch (feel.kind) {
+    case TriggerFeel::kFeedback:
+    case TriggerFeel::kWeapon:
+      return Resistance(uint8_t(std::min(feel.a * 28, 255)),
+                        uint8_t(std::min((feel.kind == TriggerFeel::kWeapon ? feel.c : feel.b) * 13, 110)));
+    case TriggerFeel::kVibration:
+      if (!feel.b) break;
+      result[0] = 0x06;
+      result[1] = feel.c;
+      result[2] = uint8_t(std::min(feel.b * 8, 63));
+      result[3] = uint8_t(std::min(feel.a * 28, 255));
+      return result;
+    default: break;
+  }
+  return Resistance(0, 0);
+}
 }  // namespace
 
 // These basic modes and byte layouts are exercised by the pinned SDL
@@ -61,6 +108,7 @@ bool Service::Fresh(const Slot& slot, uint64_t now_ms) {
 void Service::Cancel(Slot& slot) {
   CancelGestures(slot);
   slot.pulses = {};
+  slot.shot_rumble_until_ms = 0;
 }
 
 void Service::CancelGestures(Slot& slot) {
@@ -235,6 +283,28 @@ void Service::Emit(uint32_t user, uint64_t generation, Event event, float streng
   if (user >= slots_.size() || index >= kPulseMs.size() || !generation) return;
   auto& slot = slots_[user];
   if (!focused_ || slot.device.generation != generation || !Fresh(slot, now_ms) || !slot.game.active) return;
+  if (event == Event::kShot) {
+    // How fast the gun fires (shots under 0.4 s apart, same weapon slot), and
+    // the controller's shake for this shot by the kind of gun. In rapid fire
+    // each shake ends before the next shot, so the rounds are felt one by one.
+    const int weapon = std::clamp(slot.game.weapon_slot, 0, 9);
+    auto& shots = slot.shots;
+    if (shots.last_ms && now_ms > shots.last_ms && now_ms - shots.last_ms < 400 && shots.slot == weapon) {
+      const float gap = float(now_ms - shots.last_ms);
+      shots.interval_ms = shots.interval_ms > 0 ? shots.interval_ms * 0.6f + gap * 0.4f : gap;
+    } else {
+      shots.interval_ms = 0;
+    }
+    shots.last_ms = now_ms;
+    shots.slot = weapon;
+    const GunFeel& gun = Gun(weapon);
+    float ms = gun.rumble_ms ? gun.rumble_ms : 80.0f;
+    if (shots.interval_ms > 0) ms = std::min(ms, std::max(25.0f, shots.interval_ms * 0.55f));
+    slot.shot_rumble_until_ms = now_ms + uint64_t(ms);
+    slot.shot_low = (gun.rumble_ms ? gun.low : 0.35f) * Unit(strength);
+    slot.shot_high = (gun.rumble_ms ? gun.high : 1.0f) * Unit(strength);
+    return;
+  }
   auto& pulse = slot.pulses[index];
   const float previous = now_ms < pulse.until_ms ? pulse.strength : 0.0f;
   pulse = {now_ms + kPulseMs[index], std::max(previous, Unit(strength))};
@@ -263,26 +333,55 @@ Output Service::Compose(uint32_t user, uint64_t now_ms, const Options& options) 
     const auto& value = slot.pulses[static_cast<size_t>(event)];
     return now_ms < value.until_ms ? value.strength : 0.0f;
   };
-  const float shot = pulse(Event::kShot), damage = pulse(Event::kDamage), explosion = pulse(Event::kExplosion);
+  const float damage = pulse(Event::kDamage), explosion = pulse(Event::kExplosion);
+  const bool shooting = now_ms < slot.shot_rumble_until_ms;
+  const bool driving = slot.game.trigger_context == TriggerContext::kVehicle && slot.game.driver;
+  const float speed = std::isfinite(slot.game.speed) ? std::max(slot.game.speed, 0.0f) : 0.0f;
   if (options.rumble && slot.device.rumble) {
-    output.low_motor = Motor(std::max({shot * 0.35f, damage * 0.75f, explosion}) * intensity);
-    output.high_motor = Motor(std::max({shot, damage * 0.5f, explosion * 0.65f}) * intensity);
+    const float low = std::max({shooting ? slot.shot_low : 0.0f, damage * 0.75f, explosion});
+    const float high = std::max({shooting ? slot.shot_high : 0.0f, damage * 0.5f, explosion * 0.65f});
+    output.low_motor = Motor(low * intensity);
+    output.high_motor = Motor(high * intensity);
   }
   if (options.triggers && slot.device.triggers && intensity > 0) {
     using Feel = TriggerFeel;
-    if (slot.game.trigger_context == TriggerContext::kVehicle && slot.game.driver) {
-      const float left = intensity * (0.25f + 0.5f * slot.device.left_trigger / 255.0f);
-      const float right = intensity * (0.25f + 0.5f * slot.device.right_trigger / 255.0f);
-      output.left = Resistance(20, Force(left));
-      output.right = Resistance(20, Force(right));
-      output.left_feel = {Feel::kPedal, left};
-      output.right_feel = {Feel::kPedal, right};
+    // A strength on the console's 1-8 scale, by the intensity setting (as
+    // given at the default 50%, half at 0%, one and a half times at 100%).
+    auto scaled = [&](int value) {
+      return uint8_t(std::clamp(int(std::lround(float(value) * (0.5f + intensity))), 1, 8));
+    };
+    auto set = [&](Feel& feel, Trigger& report, Feel::Kind kind, uint8_t a, uint8_t b, uint8_t c) {
+      feel = {kind, intensity, a, b, c};
+      report = Report(feel);
+    };
+    if (driving) {
+      // Pedals, nothing shaking (1.0.3 Test 3's road hum and trigger buzz were
+      // too much): the gas pushes back more the further it goes, and harder
+      // the faster the car is going; the brake is a firm pedal throughout.
+      const float throttle = slot.device.right_trigger / 255.0f, brake = slot.device.left_trigger / 255.0f;
+      const float load = std::min(speed / 40.0f, 1.0f);
+      set(output.right_feel, output.right, Feel::kFeedback, 1,
+          scaled(1 + int(std::lround(3.0f * std::pow(throttle, 1.3f) + load))), 0);
+      set(output.left_feel, output.left, Feel::kFeedback, 2,
+          scaled(3 + int(std::lround(3.0f * brake))), 0);
     } else if (slot.game.trigger_context == TriggerContext::kWeapon) {
-      if (slot.game.aiming) output.left = Resistance(30, Force(intensity * 0.5f)), output.left_feel = {Feel::kAim, intensity};
-      if (slot.game.can_fire) output.right = Resistance(90, Force(intensity)), output.right_feel = {Feel::kGun, intensity};
-      if (shot > 0) {
-        output.right = Recoil(static_cast<uint8_t>(63.0f * intensity * shot));
-        output.right_feel = {Feel::kRecoil, intensity * shot};
+      const GunFeel& gun = Gun(slot.game.weapon_slot);
+      if (slot.game.aiming && gun.aim) set(output.left_feel, output.left, Feel::kFeedback, 2, scaled(gun.aim), 0);
+      if (slot.game.can_fire) {
+        const auto& shots = slot.shots;
+        const uint64_t since = now_ms >= shots.last_ms ? now_ms - shots.last_ms : UINT64_MAX;
+        const bool rapid = shots.interval_ms > 0 && shots.interval_ms < 260 &&
+                           float(since) < shots.interval_ms * 1.6f + 40.0f;
+        if (rapid) {
+          // held automatic fire: a knock a round
+          set(output.right_feel, output.right, Feel::kVibration, 1, scaled(gun.kick ? gun.kick - 1 : 6),
+              uint8_t(std::clamp(int(std::lround(1000.0f / shots.interval_ms)), 5, 30)));
+        } else if (since < gun.kick_ms) {
+          set(output.right_feel, output.right, Feel::kVibration, 1, scaled(gun.kick),
+              gun.kick_hz ? gun.kick_hz : 30);
+        } else if (gun.strength) {
+          set(output.right_feel, output.right, Feel::kWeapon, gun.start, gun.end, scaled(gun.strength));
+        }
       }
     }
   }

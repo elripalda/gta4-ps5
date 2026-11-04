@@ -227,6 +227,11 @@ class BaseHeap {
   // Queries the currently strictest readability and writability for the entire
   // range.
   rex::memory::PageAccess QueryRangeAccess(uint32_t low_address, uint32_t high_address);
+  // [ps5 port] The same without the heap lock, for checks made for every draw
+  // the game builds (the UI layout hooks', the controller's): the answer is as
+  // current as the locked one's, which can change as soon as the lock is
+  // released. Each page's entry is read whole, atomically.
+  rex::memory::PageAccess QueryRangeAccessUnlocked(uint32_t low_address, uint32_t high_address) const;
 
   // Stable only outside a mutation; may validate a cached permissions query.
   uint64_t access_epoch() const { return access_epoch_.Read(); }

@@ -15,11 +15,12 @@ The easiest way to play is **[RecompStore](https://recompstore.com)**. It instal
 ## What's in it
 - GTA IV and both Episodes from Liberty City, recompiled to run natively on the PS5
 - 4K with a 60 FPS limit. Most of the city holds 60, the busiest streets can dip into the high 40s and 50s
-- 120 Hz and VRR support, plus a 40 FPS mode for 120 Hz TVs
+- 120 Hz and VRR support, plus a 40 FPS mode for 120 Hz TVs and Smooth Heavy Areas (a steady 40 in the busiest spots)
 - PlayStation button prompts
-- DualSense light bar (police lights when you're wanted), adaptive triggers and extra rumble
+- DualSense light bar (police lights when you're wanted), adaptive triggers with a feel for each kind of gun and pedal resistance when driving, and extra rumble
+- Native PS5 trophies: the game shows up in the PS5's own Trophies list, with the PS5's trophy pop-ups (needs a payload loader such as etaHEN or elfldr)
 - A hub to pick GTA IV or either episode, each with its own look and menu music
-- Installs the game and the episodes from your own files, imports your Xbox 360 saves, backs up and restores saves, and has trophies
+- Installs the game and the episodes from your own files, imports your Xbox 360 saves, and backs up and restores saves
 - Display presets: Recommended, Performance and Quality, all at 60 FPS
 - Graphics settings: resolution, draw distance, city population, anti-aliasing, texture filtering, shadows, reflections, motion blur, film grain and FusionFix's enhanced effects
 - Centered car camera, and how quickly the car camera returns and follows
@@ -106,6 +107,7 @@ A few big reference copies in LibertyRecompAndroid's `tools/` aren't used to bui
 - **[mihawk-99](https://github.com/mihawk-99)**: [PS5_Mesa](https://github.com/mihawk-99/PS5_Mesa), the PS5 Vulkan driver
 - **[Nazky](https://github.com/Nazky)**: [ps5-plume-triangle](https://github.com/Nazky/ps5-plume-triangle), the PS5 Vulkan app setup this builds on
 - **[ps5-payload-dev](https://github.com/ps5-payload-dev)**: the PS5 payload SDK
+- **lamarking**: [RecompTrophy](https://github.com/cptlamarca/RecompTrophy), the native PS5 trophies and their pop-ups (GPL-3.0, used with permission)
 - AMD FidelityFX, [SDL3](https://github.com/libsdl-org/SDL), [Dear ImGui](https://github.com/ocornut/imgui), [FFmpeg](https://ffmpeg.org), [stb](https://github.com/nothings/stb), [dr_libs](https://github.com/mackron/dr_libs), and the TeX Gyre Heros, Oswald and Inter fonts
 - Thanks to everyone who played the betas
 

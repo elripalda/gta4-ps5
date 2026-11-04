@@ -470,7 +470,12 @@ elseif(PS5)
         src/ps5/game/trophies_game.cpp
         src/ps5/game/ps5_display.cpp
         src/ps5/game/ps5_overlay.cpp
-        src/ps5/game/save_import.cpp)
+        src/ps5/game/save_import.cpp
+        src/ps5/trophies_native/native_trophies.cpp
+        # RecompTrophy's (GPL-3.0, by lamarking, used with permission): the
+        # game's PS5 trophy set; its payloads are ps5/payload/trophies
+        src/ps5/trophies_native/install.cpp
+        src/ps5/trophies_native/trophyset.cpp)
     # (the fonts are built into it: a changed one rebuilds it)
     file(GLOB GTA4_PS5_FONTS CONFIGURE_DEPENDS "${GTA4_PS5_DIR}/assets/fonts/*.ttf"
          "${GTA4_PS5_DIR}/assets/fonts/*.otf")

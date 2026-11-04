@@ -149,7 +149,7 @@ extern "C" void sub_821BB2D0(PPCContext& ctx, uint8_t* base) {
         auto* kernel=REX_KERNEL_STATE();auto* memory=kernel?kernel->memory():nullptr;
         auto* heap=memory?memory->LookupHeap(address):nullptr;
         if(!base||!heap||address>UINT32_MAX-3||heap!=memory->LookupHeap(address+3))return {};
-        const auto access=heap->QueryRangeAccess(address,address+3);
+        const auto access=heap->QueryRangeAccessUnlocked(address,address+3);
         using rex::memory::PageAccess;
         if(access!=PageAccess::kReadOnly&&access!=PageAccess::kReadWrite&&
            access!=PageAccess::kExecuteReadOnly&&access!=PageAccess::kExecuteReadWrite)return {};
@@ -191,7 +191,7 @@ std::array<char,80> HandoffGuestName(uint8_t* base,uint32_t address) {
   auto* kernel=REX_KERNEL_STATE();auto* memory=kernel?kernel->memory():nullptr;
   auto* heap=memory?memory->LookupHeap(address):nullptr;
   if(!base||!heap||address>UINT32_MAX-79||heap!=memory->LookupHeap(address+79))return text;
-  const auto access=heap->QueryRangeAccess(address,address+79);
+  const auto access=heap->QueryRangeAccessUnlocked(address,address+79);
   using rex::memory::PageAccess;
   if(access!=PageAccess::kReadOnly&&access!=PageAccess::kReadWrite&&access!=PageAccess::kExecuteReadOnly&&access!=PageAccess::kExecuteReadWrite)return text;
   for(size_t i=0;i+1<text.size();++i) {

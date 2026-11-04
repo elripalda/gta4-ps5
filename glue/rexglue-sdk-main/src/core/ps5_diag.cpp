@@ -12,10 +12,13 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <pthread_np.h>
+#include <sched.h>
 #include <signal.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <rex/chrono/clock.h>
+#include <rex/frame_stats.h>
 #include <rex/logging.h>
 
 namespace rex::ps5diag {
@@ -72,6 +75,12 @@ struct ThreadEntry {
   uint32_t profile_parent[kProfileSamples] = {};
   std::atomic<uint32_t> profile_count{0};
   uint32_t profile_reported = 0;
+  // [ps5 port] A library sample's own address (where in libkernel, libc or
+  // the GPU driver the thread was), for "library time by place".
+  static constexpr int kLibrarySamples = 2048;
+  uint64_t library_rip[kLibrarySamples] = {};
+  std::atomic<uint32_t> library_count{0};
+  uint32_t library_reported = 0;
   // The CPUs KeepOtherThreadsOn last gave it (0: none yet).
   uint64_t applied_mask = 0;
 };
@@ -167,6 +176,11 @@ void SampleHandler(int, siginfo_t*, void* uc) {
         }
       }
     } else {
+      {
+        const uint32_t k = e->library_count.load(std::memory_order_relaxed);
+        e->library_rip[k % ThreadEntry::kLibrarySamples] = rip;
+        e->library_count.store(k + 1, std::memory_order_release);
+      }
       // In a library (libc's memcpy, a kernel wait...): charge the game code
       // that called it, the nearest return address into the eboot on the
       // stack, marked with the top bit; and note the next one in another
@@ -348,18 +362,33 @@ void ProfileReport() {
     std::unordered_map<uint32_t, uint32_t> hits, callers;
     std::unordered_map<uint64_t, uint32_t> pairs;  // caller block << 32 | its caller's block
     std::unordered_map<uint64_t, uint32_t> code_pairs;  // block << 32 | its caller's block
+    std::unordered_map<uint64_t, uint32_t> places;      // library samples by 16-byte address
   };
   std::vector<Busy> busy;
   const int count = std::min(next_thread.load(), kThreads);
+  // [ps5 port] The game's render thread (the one the frame limiter runs on)
+  // by its own name, not "rex" like every other game thread.
+  const uintptr_t title = rex::frame_stats::g_title_thread.load(std::memory_order_relaxed);
   for (int i = 0; i < count; ++i) {
     ThreadEntry& e = threads[i];
     if (!e.used.load(std::memory_order_acquire)) continue;
+    if (title && reinterpret_cast<uintptr_t>(e.pthread) == title && std::strcmp(e.what, "title") != 0)
+      std::strncpy(e.what, "title", sizeof(e.what) - 1);
     const uint32_t end = e.profile_count.load(std::memory_order_acquire);
     uint32_t begin = e.profile_reported;
     if (end - begin > uint32_t(ThreadEntry::kProfileSamples))
       begin = end - ThreadEntry::kProfileSamples;
     e.profile_reported = end;
-    Busy b{&e, end - begin, 0, 0, {}, {}, {}, {}};
+    Busy b{&e, end - begin, 0, 0, {}, {}, {}, {}, {}};
+    {
+      const uint32_t lib_end = e.library_count.load(std::memory_order_acquire);
+      uint32_t lib_begin = e.library_reported;
+      if (lib_end - lib_begin > uint32_t(ThreadEntry::kLibrarySamples))
+        lib_begin = lib_end - ThreadEntry::kLibrarySamples;
+      e.library_reported = lib_end;
+      for (uint32_t k = lib_begin; k != lib_end; ++k)
+        if (const uint64_t rip = e.library_rip[k % ThreadEntry::kLibrarySamples]) ++b.places[rip & ~uint64_t(15)];
+    }
     for (uint32_t k = begin; k != end; ++k) {
       const uint32_t pc = e.profile[k % ThreadEntry::kProfileSamples];
       if (!pc) continue;
@@ -381,6 +410,31 @@ void ProfileReport() {
   std::sort(busy.begin(), busy.end(), [](const Busy& a, const Busy& b) { return a.inside > b.inside; });
 
   REXLOG_INFO("ps5 prof: anchor {:X}, {} threads ran game code", Anchor(), busy.size());
+  {
+    // Where some library functions are, to name the places below by: a place
+    // just past one of these is most likely in it.
+    static bool landmarks_logged = false;
+    if (!landmarks_logged) {
+      landmarks_logged = true;
+      void* (*mcpy)(void*, const void*, size_t) = &memcpy;
+      void* (*mmove)(void*, const void*, size_t) = &memmove;
+      void* (*mset)(void*, int, size_t) = &memset;
+      int (*lock)(pthread_mutex_t*) = &pthread_mutex_lock;
+      int (*unlock)(pthread_mutex_t*) = &pthread_mutex_unlock;
+      int (*cwait)(pthread_cond_t*, pthread_mutex_t*) = &pthread_cond_wait;
+      int (*csignal)(pthread_cond_t*) = &pthread_cond_signal;
+      int (*sleep)(const timespec*, timespec*) = &nanosleep;
+      int (*yield)() = &sched_yield;
+      void* (*get)(pthread_key_t) = &pthread_getspecific;
+      int (*clock)(clockid_t, timespec*) = &clock_gettime;
+      REXLOG_INFO("ps5 prof: landmarks memcpy {:X} memmove {:X} memset {:X} mutex_lock {:X} mutex_unlock {:X} "
+                  "cond_wait {:X} cond_signal {:X} nanosleep {:X} sched_yield {:X} getspecific {:X} "
+                  "clock_gettime {:X}",
+                  uintptr_t(mcpy), uintptr_t(mmove), uintptr_t(mset), uintptr_t(lock), uintptr_t(unlock),
+                  uintptr_t(cwait), uintptr_t(csignal), uintptr_t(sleep), uintptr_t(yield), uintptr_t(get),
+                  uintptr_t(clock));
+    }
+  }
   // Every block seen twice or more, 120 to a line: the whole picture, not
   // just the top (a frame's work is spread over many functions).
   auto emit = [](const Busy& b, const char* kind, const std::unordered_map<uint32_t, uint32_t>& map,
@@ -428,6 +482,17 @@ void ProfileReport() {
     emit(busy[t], "in libraries, by caller", busy[t].callers, busy[t].via);
     emit_pairs(busy[t], busy[t].pairs, "in libraries, by caller/parent", busy[t].via);
     emit_pairs(busy[t], busy[t].code_pairs, "in game code, by block/parent", busy[t].inside);
+    if (t < 5 && !busy[t].places.empty()) {
+      std::vector<std::pair<uint64_t, uint32_t>> all(busy[t].places.begin(), busy[t].places.end());
+      std::sort(all.begin(), all.end(), [](const auto& x, const auto& y) { return x.second > y.second; });
+      std::string line;
+      for (size_t i = 0; i < all.size() && i < 60 && all[i].second >= 2; ++i) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), " %llX:%u", static_cast<unsigned long long>(all[i].first), all[i].second);
+        line += buf;
+      }
+      REXLOG_INFO("ps5 prof: tid {} {}: library time by place:{}", busy[t].e->tid, busy[t].e->what, line);
+    }
   }
 }
 

@@ -110,9 +110,17 @@ void TrophyPopup::Push(const rex::system::AchievementEvent& event) {
   REXLOG_INFO("trophies: {} ({}, {}G){}", event.achievement.label,
               trophies::GradeName(trophies::GradeFor(event.achievement.gamerscore)), event.achievement.gamerscore,
               platinum ? ", and with it the platinum" : "");
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    queue_.push_back({event.achievement, false, std::nullopt});
+    if (platinum) queue_.push_back({event.achievement, true, std::nullopt});
+  }
+  RequestRepaint();
+}
+
+bool TrophyPopup::WantsContinuousRepaint() const {
   std::lock_guard<std::mutex> lock(mutex_);
-  queue_.push_back({event.achievement, false, std::nullopt});
-  if (platinum) queue_.push_back({event.achievement, true, std::nullopt});
+  return !queue_.empty();
 }
 
 void TrophyPopup::Chime(bool platinum) {

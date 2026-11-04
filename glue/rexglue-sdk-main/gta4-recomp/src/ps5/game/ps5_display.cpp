@@ -31,6 +31,16 @@ REXCVAR_DEFINE_STRING(ps5_frame_generation, "off", "PS5",
     .allowed({"off", "30-60", "60-120"});
 REXCVAR_DEFINE_BOOL(ps5_pacing_log, true, "PS5",
                     "Every 10 s, log how long the TV showed each of the game's frames and how evenly they came");
+REXCVAR_DEFINE_BOOL(ps5_even_frames, true, "PS5",
+                    "At 120 Hz with a 60 limit: hold each image until the one before has been on the TV a whole "
+                    "vblank, so none is shown for a single refresh (8 ms) between two of 16 and 25");
+REXCVAR_DEFINE_BOOL(ps5_smooth_40, false, "PS5",
+                    "At 120 Hz with a 60 limit: where the game can't hold 60, an even 40 (each frame three vblanks) "
+                    "instead of frames between 40 and 60, back to 60 once it can");
+REXCVAR_DEFINE_BOOL(ps5_vrr_keepalive, true, "PS5",
+                    "With VRR at 120 Hz and a 60 limit, while the game's frames take longer than the TV waits "
+                    "between refreshes (~21 ms): refresh the frame on the TV once, timed so the TV is free again "
+                    "when the late frame comes (shown then, not ~29 ms after the one before)");
 REXCVAR_DECLARE(uint32_t, gta4_frame_limit);
 REXCVAR_DECLARE(bool, ps5_overlay_every_vblank);
 REXCVAR_DECLARE(bool, gta4_native_texture_watch);
@@ -44,6 +54,7 @@ int __real_sceVideoOutConfigureOutput(int32_t handle, uint32_t mode, const void*
                                       const void* reserved2, const void* reserved3);
 int __real_sceVideoOutSetFlipRate(int32_t handle, int32_t rate);
 int sceVideoOutWaitVblank(int32_t handle);
+uint64_t sceKernelGetProcessTime(void);
 }
 
 namespace gta4ps5::display {
@@ -94,10 +105,13 @@ int32_t WantedRate() {
   // while the game runs at a quarter of 120 Hz. The frame limit doesn't apply.
   if (rex::frame_stats::g_frame_generation_active.load(std::memory_order_acquire))
     return int32_t(std::max<uint32_t>(rex::frame_stats::g_fg_vblanks_per_image.load(std::memory_order_acquire), 1)) - 1;
-  const uint32_t fps = REXCVAR_GET(gta4_frame_limit);
+  const uint32_t effective = rex::frame_stats::g_effective_frame_limit.load(std::memory_order_acquire);
+  const uint32_t fps = effective ? effective : REXCVAR_GET(gta4_frame_limit);
   // VRR: the TV refreshes when a frame comes; the frame limit's own pacing
-  // (Ps5LimitFrameRate) spaces them. (30 and 40 are under most TVs' VRR
-  // floor: held to vblanks as at a fixed 120 Hz.)
+  // (Ps5LimitFrameRate) spaces them. (1.0.3 Test 1 held them to two vblanks
+  // as at a fixed 120 Hz: every frame past 16.7 ms then waited for the next
+  // pair and stayed up 33 ms, where VRR shows it at 20 or 25. 30 and 40 are
+  // under most TVs' VRR floor: held to vblanks as at a fixed 120 Hz.)
   if (g_vrr.load(std::memory_order_acquire) && (fps == 0 || fps == 60 || fps == 120)) return 0;
   if (g_high.load(std::memory_order_acquire)) {
     if (fps == 40) return 2;
@@ -108,6 +122,8 @@ int32_t WantedRate() {
 }
 
 void Apply(const char* why) {
+  static std::mutex apply_mutex;  // (from the hub, the game's render thread, the cvar callback)
+  std::lock_guard lock(apply_mutex);
   const int32_t handle = g_handle.load(std::memory_order_acquire);
   const int32_t rate = WantedRate();
   if (handle < 0 || g_rate.load(std::memory_order_acquire) == rate) return;
@@ -148,7 +164,96 @@ struct PacingWindow {
   int64_t shown_min = 0, shown_max = 0;
   std::array<uint32_t, 4> game{};  // the game's frames: to 17.5 ms, 25, 34.5, longer
   uint32_t jumps = 0;              // a game frame 4 ms or more off the one before
+  uint32_t by_flip = 0;            // holds timed by the flips themselves
 };
+
+// [ps5 port] Before the presenter queues an image: at 120 Hz with a 60 limit
+// (flip rate 0), the image before it must have been on the TV a whole vblank,
+// so this one, shown at the next, gives it two. 1.0.3 Test 3's logs: with the
+// game on time (8 ms of work a frame, waiting for its slot), a third of the
+// frames still came 8 ms after the one before and a third 25 ms (finished
+// frames landing on either side of a vblank). A frame that's late still goes
+// out at the next vblank. Waits at most ~25 ms; the VideoOut flip clock
+// (sceKernelGetProcessTime's microseconds) is checked first, once.
+// The new frames held, and for how long, for the pacing log.
+std::atomic<uint64_t> g_holds{0}, g_hold_us{0};
+
+void HoldBeforePresent() {
+  if (!REXCVAR_GET(ps5_even_frames) || !g_high.load(std::memory_order_acquire) ||
+      g_rate.load(std::memory_order_acquire) != 0 ||
+      rex::frame_stats::g_frame_generation_active.load(std::memory_order_acquire))
+    return;
+  const uint32_t effective = rex::frame_stats::g_effective_frame_limit.load(std::memory_order_acquire);
+  if ((effective ? effective : REXCVAR_GET(gta4_frame_limit)) != 60) return;
+  const int32_t handle = g_handle.load(std::memory_order_acquire);
+  if (handle < 0) return;
+  // The flip's time must be on sceKernelGetProcessTime's clock: not ahead of
+  // it, and not years behind. (Test 4 also asked for it to be under a second
+  // old, and the first check came during a loading screen, 1.7 s after its
+  // last flip: off for the whole session.) 32 failed checks in a row: off.
+  static std::atomic<int> clock_failures{0};
+  static std::atomic<bool> clock_logged{false};
+  if (clock_failures.load(std::memory_order_relaxed) >= 32) return;
+  constexpr uint64_t kVblankUs = 8342, kMarginUs = 400, kGiveUpUs = 25000;
+  const uint64_t begin = sceKernelGetProcessTime();
+  // Only a new game frame is held: the presenter also sends the frame on the
+  // TV again at the TV's rate (about 110 images a second at 60 FPS), and
+  // those just keep it there. 1.1's first two builds held every image, the
+  // repeats too: a new frame then waited behind a repeat and was up 25 ms
+  // (15% of frames) where it should have been 16.7.
+  // (The repaints themselves are gone too: Presenter::PaintFromUIThreadImpl.)
+  // The previous new frame is on the TV once a flip came after it was sent
+  // (the flips' own times, VideoOut's status[1], on the process clock: no
+  // frame numbers or counts, which the driver doesn't promise), and has had
+  // its whole vblank a vblank (and a margin) after that flip. 16 waits in a
+  // row running out (the graphics card that far behind) pause this for the
+  // next 600 frames.
+  if (!rex::frame_stats::g_present_new_frame.load(std::memory_order_acquire)) return;
+  static uint64_t previous_sent_us = 0;
+  static bool have_previous = false;
+  static int give_ups = 0, paused_frames = 0;
+  if (paused_frames > 0) {
+    --paused_frames;
+    return;
+  }
+  for (;;) {
+    uint64_t status[16] = {};
+    if (sceVideoOutGetFlipStatus(handle, status) != 0) return;
+    const uint64_t now = sceKernelGetProcessTime();
+    const uint64_t flipped = status[1];  // (when the last flip happened)
+    const int32_t pending = int32_t(status[6] >> 32);
+    const bool clock_ok = flipped && flipped <= now + 2000 && now - flipped < 600000000ull;
+    if (!clock_ok) {
+      if (clock_failures.fetch_add(1, std::memory_order_relaxed) == 31)
+        REXLOG_INFO("ps5 even frames: off (the flip time {} isn't on the process clock, now {})", flipped, now);
+      return;
+    }
+    clock_failures.store(0, std::memory_order_relaxed);
+    if (!clock_logged.exchange(true, std::memory_order_relaxed))
+      REXLOG_INFO("ps5 even frames: on (last flip {} us ago, {} pending)", int64_t(now) - int64_t(flipped), pending);
+    const bool previous_shown = !have_previous || flipped >= previous_sent_us;
+    const bool go = previous_shown && pending <= 0 && (now < flipped || now - flipped >= kVblankUs + kMarginUs);
+    const bool ran_out = now - begin > kGiveUpUs;
+    if (go || ran_out) {
+      if (ran_out && ++give_ups >= 16) {
+        REXLOG_INFO("ps5 even frames: paused for 600 frames (16 waits in a row ran out; last flip at {}, previous "
+                    "frame sent at {})", flipped, previous_sent_us);
+        give_ups = 0;
+        paused_frames = 600;
+      }
+      if (!ran_out) give_ups = 0;
+      previous_sent_us = now;
+      have_previous = true;
+      if (now > begin + 200) {
+        g_holds.fetch_add(1, std::memory_order_relaxed);
+        g_hold_us.fetch_add(now - begin, std::memory_order_relaxed);
+      }
+      return;
+    }
+    const timespec delay{0, 300000};
+    nanosleep(&delay, nullptr);
+  }
+}
 
 void PacingMain() {
   using namespace rex::frame_stats;
@@ -156,6 +261,11 @@ void PacingMain() {
   int64_t flip = -1;             // the flip shown at the last look
   uint64_t frame = 0;            // the game frame (publication) it showed
   int64_t frame_since_ns = 0;    // when that frame came on screen (0: not known)
+  uint64_t frame_since_us = 0;   // the same by the flip's own time (0: not known)
+  // VRR keep-alive: the time between new frames on the TV (ms, smoothed),
+  // and whether this frame has had its refresh.
+  double interval_ms = 16.7;
+  bool kept_alive = false;
   uint32_t last_held = 0, last_game_us = 0;
   uint64_t game_seen = g_presents.load(std::memory_order_acquire);
   PacingWindow w;
@@ -179,26 +289,64 @@ void PacingMain() {
           const uint64_t next = g_image_frame[uint64_t(i) % kImageHistory].load(std::memory_order_relaxed);
           if (next != f) ++changed, f = next;
         }
+        // When the flip itself happened (VideoOut's clock), if this look saw
+        // only it: this thread's looks can come late on a busy CPU, which put
+        // a late look's lateness on one frame and took it off the next (Test 3).
+        const uint64_t flip_us = shown - flip == 1 ? status[1] : 0;
         if (changed == 1 && frame_since_ns) {
-          const int64_t held = now - frame_since_ns;
+          int64_t held = now - frame_since_ns;
+          if (flip_us && frame_since_us && flip_us > frame_since_us && flip_us - frame_since_us < 1000000) {
+            const int64_t by_flip = int64_t(flip_us - frame_since_us) * 1000;
+            if (std::abs(by_flip - held) < 12000000) held = by_flip, ++w.by_flip;
+          }
           const double vblank = g_high.load(std::memory_order_relaxed) ? 8341700.0 : 16683400.0;
           const uint32_t n = uint32_t(std::clamp<long>(std::lround(double(held) / vblank), 1, 4));
           ++w.shown[n - 1];
+          {
+            const uint64_t k = g_tv_shown.load(std::memory_order_relaxed);
+            g_tv_hold_us[k % kTvHistory].store(uint32_t(std::min<int64_t>(held / 1000, 4000000)),
+                                               std::memory_order_relaxed);
+            g_tv_shown.store(k + 1, std::memory_order_release);
+          }
+          interval_ms = interval_ms * 0.8 + double(held) / 1e6 * 0.2;
           if (last_held && n != last_held) ++w.changes;
           last_held = n;
           w.shown_min = w.shown_min ? std::min(w.shown_min, held) : held;
           w.shown_max = std::max(w.shown_max, held);
         } else if (changed > 1) {
           w.unseen += changed - 1;
+          g_tv_missed.fetch_add(changed - 1, std::memory_order_relaxed);
           last_held = 0;
         }
-        if (changed) frame = f, frame_since_ns = now;
+        if (changed) frame = f, frame_since_ns = now, frame_since_us = flip_us, kept_alive = false;
       } else {
         frame = known ? g_image_frame[uint64_t(shown) % kImageHistory].load(std::memory_order_relaxed) : 0;
         frame_since_ns = 0;
+        frame_since_us = 0;
         last_held = 0;
       }
       flip = shown;
+    }
+    // [ps5 port] VRR keep-alive. With VRR the TV waits at most ~20.9 ms (its
+    // 48 Hz floor) for the next frame, then refreshes the old one by itself,
+    // and a refresh takes 8.3 ms at 120 Hz: a frame that came 21-29 ms after
+    // the one before waited for it and was up ~29 ms (1.1's busy streets, a
+    // third of frames). While frames are coming that late, this refresh comes
+    // sooner, when the next frame is expected less a refresh and a
+    // millisecond, so the TV is free again when it arrives.
+    {
+      const uint32_t effective = g_effective_frame_limit.load(std::memory_order_relaxed);
+      const bool applies = REXCVAR_GET(ps5_vrr_keepalive) && g_vrr.load(std::memory_order_relaxed) &&
+                           g_high.load(std::memory_order_relaxed) && g_rate.load(std::memory_order_relaxed) == 0 &&
+                           (effective ? effective : REXCVAR_GET(gta4_frame_limit)) == 60 &&
+                           !g_frame_generation_active.load(std::memory_order_relaxed);
+      if (applies && !kept_alive && frame_since_ns && interval_ms > 21.0) {
+        const double at_ms = std::clamp(interval_ms - 8.34 - 1.0, 11.0, 19.5);
+        if (double(now - frame_since_ns) / 1e6 >= at_ms) {
+          kept_alive = true;
+          if (auto* request = g_request_keepalive_paint.load(std::memory_order_acquire)) request();
+        }
+      }
     }
     // the game's frames since the last look
     const uint64_t presents = g_presents.load(std::memory_order_acquire);
@@ -218,17 +366,27 @@ void PacingMain() {
     }
     const uint32_t shown_total = w.shown[0] + w.shown[1] + w.shown[2] + w.shown[3];
     const uint32_t game_total = w.game[0] + w.game[1] + w.game[2] + w.game[3];
+    const uint64_t holds = g_holds.exchange(0, std::memory_order_relaxed);
+    const uint64_t hold_us = g_hold_us.exchange(0, std::memory_order_relaxed);
     REXLOG_INFO(
         "ps5 pacing: the TV showed {} frames: {} for 1 vblank, {} for 2, {} for 3, {} for 4 or more ({} times "
         "held for a different number than the frame before; {:.1f} to {:.1f} ms; {} gone between looks); the "
         "game's {} frames: {} to 17.5 ms, {} to 25, {} to 34.5, {} longer, {} jumps of 4 ms or more; {} "
-        "images queued, not shown yet; {} Hz{}, frame limit {}, frames {}, texture watch {}, log {}; version {}",
+        "images queued, not shown yet; {} Hz{}, frame limit {}{}, frames {}{}, texture watch {}, log {}; {} holds "
+        "timed by the flips; {} new frames held back, {:.1f} ms each; {} repaints of the frame on the TV skipped, {} "
+        "made to keep VRR ready; version {}",
         shown_total, w.shown[0], w.shown[1], w.shown[2], w.shown[3], w.changes, w.shown_min / 1e6,
         w.shown_max / 1e6, w.unseen, game_total, w.game[0], w.game[1], w.game[2], w.game[3], w.jumps,
         flip > 0 ? int64_t(g_images_sent.load(std::memory_order_acquire)) - flip : -1,
         g_high.load() ? "119.88" : "59.94", g_vrr.load() ? " VRR" : "", REXCVAR_GET(gta4_frame_limit),
+        rex::frame_stats::g_effective_frame_limit.load() == 40 && REXCVAR_GET(gta4_frame_limit) != 40
+            ? " (at 40 now)" : "",
         REXCVAR_GET(ps5_overlay_every_vblank) ? "every vblank" : "as finished",
-        REXCVAR_GET(gta4_native_texture_watch) ? "on" : "off", REXCVAR_GET(log_level), GTA4PS5_VERSION);
+        REXCVAR_GET(ps5_even_frames) ? ", held whole vblanks" : "",
+        REXCVAR_GET(gta4_native_texture_watch) ? "on" : "off", REXCVAR_GET(log_level), w.by_flip, holds,
+        holds ? double(hold_us) / 1000.0 / double(holds) : 0.0,
+        rex::frame_stats::g_repeat_paints_skipped.exchange(0, std::memory_order_relaxed),
+        rex::frame_stats::g_keepalive_paints.exchange(0, std::memory_order_relaxed), GTA4PS5_VERSION);
     w = {};
   }
 }
@@ -289,6 +447,7 @@ void StartGamePacing() {
   g_game.store(true, std::memory_order_release);
   rex::frame_stats::g_display_pacing_changed.store(+[](const char* why) { Apply(why); },
                                                    std::memory_order_release);
+  rex::frame_stats::g_before_present.store(&HoldBeforePresent, std::memory_order_release);
   static std::atomic<bool> registered{false};
   if (!registered.exchange(true)) {
     rex::cvar::RegisterChangeCallback("gta4_frame_limit",

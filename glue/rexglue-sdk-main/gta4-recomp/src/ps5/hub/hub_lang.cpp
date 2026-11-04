@@ -79,6 +79,7 @@ const Entry kTable[] = {
     {{"Small Object Shadows", "Ombres des petits objets", "Schatten kleiner Objekte", "Sombras de objetos pequeños", "Ombre oggetti piccoli"}},
     {{"Car Reflections", "Reflets des voitures", "Fahrzeugspiegelungen", "Reflejos de coches", "Riflessi auto"}},
     {{"Skip Intro", "Passer l'intro", "Intro überspringen", "Saltar intro", "Salta intro"}},
+    {{"PS5 Trophies", "Trophées PS5", "PS5-Trophäen", "Trofeos de PS5", "Trofei PS5"}},
     {{"Centered Car Camera", "Caméra de véhicule centrée", "Zentrierte Fahrzeugkamera", "Cámara de vehículo centrada",
       "Telecamera veicolo centrata"}},
     {{"Car Camera Return", "Retour de la caméra de véhicule", "Rückkehr der Fahrzeugkamera",
@@ -117,6 +118,7 @@ const Entry kTable[] = {
     {{"Every Vblank", "À chaque rafraîchissement", "Bei jedem Vblank", "En cada refresco", "A ogni refresh"}},
     {{"Texture Watch", "Surveillance des textures", "Texturüberwachung", "Vigilancia de texturas", "Controllo texture"}},
     {{"Light Test", "Test des lumières", "Lichttest", "Prueba de luces", "Test luci"}},
+    {{"Cutscenes at 30", "Cinématiques à 30", "Zwischensequenzen mit 30", "Cinemáticas a 30", "Filmati a 30"}},
     {{"No Stencil", "Sans stencil", "Ohne Stencil", "Sin stencil", "Senza stencil"}},
     {{"No Clamp", "Sans clamp", "Ohne Clamp", "Sin clamp", "Senza clamp"}},
     {{"Auto", "Auto", "Auto", "Auto", "Auto"}},
@@ -431,6 +433,17 @@ const Entry kTable[] = {
       "Geht direkt zum Startbildschirm des Spiels, vorbei an den Logos und Rechtshinweisen.",
       "Va directo a la pantalla de inicio del juego, sin los logotipos ni los avisos legales.",
       "Va direttamente alla schermata iniziale del gioco, saltando loghi e note legali."}},
+    {{"Adds the game's trophies to the PS5's own Trophies list, with the ones you've already earned, and shows "
+      "the PS5's trophy pop-ups as you earn them. Needs a payload loader (etaHEN, elfldr...).",
+      "Ajoute les trophées du jeu à la liste Trophées de la PS5, avec ceux que vous avez déjà obtenus, et affiche "
+      "les notifications de trophée de la PS5 quand vous les obtenez. Nécessite un chargeur de payloads (etaHEN, "
+      "elfldr...).",
+      "Fügt die Trophäen des Spiels der Trophäenliste der PS5 hinzu, samt den bereits verdienten, und zeigt die "
+      "Trophäen-Meldungen der PS5, sobald du sie verdienst. Benötigt einen Payload-Loader (etaHEN, elfldr...).",
+      "Añade los trofeos del juego a la lista de Trofeos de la PS5, con los que ya hayas conseguido, y muestra los "
+      "avisos de trofeo de la PS5 al conseguirlos. Necesita un cargador de payloads (etaHEN, elfldr...).",
+      "Aggiunge i trofei del gioco all'elenco Trofei della PS5, con quelli già ottenuti, e mostra le notifiche dei "
+      "trofei della PS5 quando li ottieni. Richiede un caricatore di payload (etaHEN, elfldr...)."}},
     {{"Turns the controller extras below on or off together: the light bar, adaptive triggers and extra rumble.",
       "Active ou coupe d'un coup les fonctions de la manette ci-dessous\u00A0: barre lumineuse, gâchettes "
       "adaptatives et vibrations supplémentaires.",
@@ -762,6 +775,11 @@ const Entry kTable[] = {
       "LibertyRecompAndroid: die Fixes, damit es auf Handheld-Hardware läuft.",
       "LibertyRecompAndroid: los arreglos para que funcione en dispositivos portátiles.",
       "LibertyRecompAndroid: le correzioni per farlo girare su dispositivi portatili."}},
+    {{"RecompTrophy: the native PS5 trophies and their pop-ups.",
+      "RecompTrophy : les trophées PS5 natifs et leurs notifications.",
+      "RecompTrophy: die nativen PS5-Trophäen und ihre Einblendungen.",
+      "RecompTrophy: los trofeos nativos de PS5 y sus avisos.",
+      "RecompTrophy: i trofei nativi di PS5 e le loro notifiche."}},
     {{"The static recompiler and runtime that turn the Xbox 360 game into a native program.",
       "Le recompilateur statique et l'environnement d'exécution qui transforment le jeu Xbox 360 en programme "
       "natif.",

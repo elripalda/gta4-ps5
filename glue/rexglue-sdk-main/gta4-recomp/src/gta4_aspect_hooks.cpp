@@ -31,6 +31,11 @@ struct OutputState {
 };
 std::mutex output_mutex;
 OutputState output_state;
+// [ps5 port] Bumped (under output_mutex) whenever output_state changes, so
+// Output() can hand back a per-thread copy without taking the lock. It is
+// read on every draw command; the lock showed up in the PS5 profiles.
+std::atomic<uint64_t> output_version{1};
+std::atomic<bool> output_ready{false};
 thread_local UiContext ui_context;
 thread_local unsigned baked_font_depth = 0;
 thread_local unsigned append_depth = 0;
@@ -56,7 +61,7 @@ bool Span(uint8_t* base, uint32_t address, size_t size, bool write = false) {
   const uint32_t last = uint32_t(uint64_t(address) + size - 1);
   if (!heap || heap != memory->LookupHeap(last))
     return false;
-  const auto access = heap->QueryRangeAccess(address, last);
+  const auto access = heap->QueryRangeAccessUnlocked(address, last);
   using rex::memory::PageAccess;
   return access == PageAccess::kReadWrite || access == PageAccess::kExecuteReadWrite ||
          (!write && (access == PageAccess::kReadOnly || access == PageAccess::kExecuteReadOnly));
@@ -77,8 +82,19 @@ void Float(uint8_t* base, uint32_t address, double value) {
   Write(base, address, std::bit_cast<uint32_t>(float(value)));
 }
 OutputState Output() {
+  // (one thread_local: on the PS5 each is a lookup through the system)
+  struct Cached {
+    OutputState state;
+    uint64_t version = 0;
+  };
+  thread_local Cached cached;
+  Cached& c = cached;
+  if (output_version.load(std::memory_order_acquire) == c.version)
+    return c.state;
   std::lock_guard lock(output_mutex);
-  return output_state;
+  c.state = output_state;
+  c.version = output_version.load(std::memory_order_relaxed);
+  return c.state;
 }
 bool Trace() {
   return REXCVAR_GET(gta4_trace_aspect) &&
@@ -175,6 +191,23 @@ std::unordered_map<uint32_t, DcLayout> dc_layouts;
 std::deque<std::pair<uint32_t, uint64_t>> dc_order;
 uint64_t next_dc_serial = 0;
 constexpr size_t kMaximumDcLayouts = 32768;
+// [ps5 port] How many dc_layouts entries fall in each bucket of command
+// addresses, changed only under dc_mutex. FinalizeDc runs for every draw
+// command the game makes (world ones too) and used to lock and search the map
+// each time; a command that is not a UI one and whose bucket is empty cannot
+// be in the map, so it skips both. (32768 entries at most: no overflow.)
+constexpr uint32_t kDcBuckets = 1u << 16;
+std::atomic<uint16_t> dc_bucket_count[kDcBuckets];
+uint32_t DcBucket(uint32_t dc) {
+  return ((dc >> 2) * 2654435761u) >> 16;
+}
+void EraseDcLayout(std::unordered_map<uint32_t, DcLayout>::iterator it) {
+  dc_bucket_count[DcBucket(it->first)].fetch_sub(1, std::memory_order_relaxed);
+  dc_layouts.erase(it);
+}
+bool MaybeDcLayout(uint32_t dc) {
+  return dc_bucket_count[DcBucket(dc)].load(std::memory_order_acquire) != 0;
+}
 
 bool LayoutDc(uint32_t vtable) {
   return HasUiDrawExecutor(vtable);
@@ -183,6 +216,8 @@ bool LayoutDc(uint32_t vtable) {
 UiContext DcContext(PPCContext& ctx, uint8_t* base) {
   const uint32_t dc = ctx.r3.u32;
   if (!Span(base, dc, 8))
+    return ui_context;
+  if (!MaybeDcLayout(dc))
     return ui_context;
   const uint32_t vtable = Read(base, dc), token = StableDcToken(Read(base, dc + 4));
   std::lock_guard lock(dc_mutex);
@@ -276,6 +311,10 @@ void Publish(Extent render, Extent output) {
               render.width != output_state.render.width ||
               render.height != output_state.render.height;
     output_state = {render, output, true, output_state.generation + uint64_t(changed)};
+    if (changed) {
+      output_version.fetch_add(1, std::memory_order_release);
+      output_ready.store(true, std::memory_order_release);
+    }
   }
   if (changed) {
     const auto layout = Layout(output);
@@ -373,23 +412,28 @@ Scope::~Scope() {
 DcScope::DcScope(PPCContext& ctx, uint8_t* base) : scope_(DcContext(ctx, base)) {}
 
 void FinalizeDc(uint8_t* base, uint32_t dc) {
-  if (!Output().ready || !Span(base, dc, 8))
+  if (!output_ready.load(std::memory_order_acquire) || !Span(base, dc, 8))
     return;
   const uint32_t vtable = Read(base, dc), token = StableDcToken(Read(base, dc + 4));
+  const bool keep = LayoutDc(vtable) && ui_context.active;
+  if (!keep && !MaybeDcLayout(dc))
+    return;
   std::lock_guard lock(dc_mutex);
   // Invalidate on every publication, including reuse by a non-UI command.
-  dc_layouts.erase(dc);
-  if (!LayoutDc(vtable) || !ui_context.active)
+  if (const auto it = dc_layouts.find(dc); it != dc_layouts.end())
+    EraseDcLayout(it);
+  if (!keep)
     return;
   const uint64_t serial = ++next_dc_serial;
   dc_layouts.emplace(dc, DcLayout{token, vtable, serial, ui_context});
+  dc_bucket_count[DcBucket(dc)].fetch_add(1, std::memory_order_release);
   dc_order.emplace_back(dc, serial);
   // Both containers are bounded. Token + vtable prevents address-reuse contamination.
   for (; dc_order.size() > kMaximumDcLayouts; dc_order.pop_front()) {
     const auto [old_dc, old_serial] = dc_order.front();
     const auto it = dc_layouts.find(old_dc);
     if (it != dc_layouts.end() && it->second.serial == old_serial)
-      dc_layouts.erase(it);
+      EraseDcLayout(it);
   }
 }
 void PrepareViewport(PPCContext& ctx, uint8_t* base) {

@@ -21,6 +21,15 @@ inline std::atomic<uint32_t> g_last_frame_us{0};
 // The last kHistory frames' times (frame n at n % kHistory), for the graph.
 inline constexpr uint32_t kHistory = 256;
 inline std::atomic<uint32_t> g_history_us[kHistory];
+// [ps5 port] What the TV showed (ps5_display's pacing thread, from VideoOut's
+// flips): how long each frame stayed on screen (frame n at n % kTvHistory),
+// how many it showed, and frames that came and went between two looks. The
+// FPS counter reads these: a frame held three vblanks is a stutter there even
+// when the game finished it on time.
+inline constexpr uint32_t kTvHistory = 512;
+inline std::atomic<uint32_t> g_tv_hold_us[kTvHistory];
+inline std::atomic<uint64_t> g_tv_shown{0};
+inline std::atomic<uint64_t> g_tv_missed{0};
 
 // [ps5 port] Set while FSR 3 frame generation is chosen and the device can
 // run it; with it off (or unavailable) presentation is decoupled.
@@ -32,6 +41,22 @@ inline std::atomic<bool> g_frame_generation_active{false};
 // hook, which re-applies VideoOut's flip rate.
 inline std::atomic<uint32_t> g_fg_vblanks_per_image{1};
 inline std::atomic<void (*)(const char*)> g_display_pacing_changed{nullptr};
+// [ps5 port] Called by the presenter right before it queues an image to the
+// TV (ps5_display.cpp: holds it until the image before has had its full time).
+inline std::atomic<void (*)()> g_before_present{nullptr};
+// Whether the image about to be presented carries a new game frame (not the
+// one on the TV again: the presenter re-presents it at the TV's rate).
+inline std::atomic<bool> g_present_new_frame{true};
+// UI-thread repaints of the frame already on the TV that were skipped.
+inline std::atomic<uint64_t> g_repeat_paints_skipped{0};
+// [ps5 port] Asks the presenter for one paint of the frame on the TV (set by
+// the presenter), and how many were made: ps5_display.cpp's refresh while the
+// game is behind.
+inline std::atomic<void (*)()> g_request_keepalive_paint{nullptr};
+inline std::atomic<uint64_t> g_keepalive_paints{0};
+// The frame limit in effect: the setting's, or 40 while Smooth Heavy Areas
+// holds a 60 limit there (the game's frame limiter sets it; 0 until then).
+inline std::atomic<uint32_t> g_effective_frame_limit{0};
 // Images presented as generated + real pairs, and real frames that went out
 // alone (no generated partner), for the timing line.
 inline std::atomic<uint64_t> g_fg_pairs{0}, g_fg_unpaired{0};

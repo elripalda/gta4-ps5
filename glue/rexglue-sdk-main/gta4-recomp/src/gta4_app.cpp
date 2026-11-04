@@ -31,6 +31,10 @@
 #include <rex/ui/flags.h>
 #include <rex/ui/keybinds.h>
 #include <rex/ui/window.h>
+#include <string_view>
+#if REX_PLATFORM_PS5
+REXCVAR_DECLARE(std::string, ps5_frame_generation);
+#endif
 
 #include "achievement_bridge_gc.h"
 #include "gta4_frontend_hooks.h"
@@ -750,9 +754,11 @@ void GTA4App::OnPreSetup(rex::RuntimeConfig& config) {
     REXCVAR_SET(gta4_native_upscaler, "native");
   }
 #if REX_PLATFORM_PS5
-  // [ps5 port] Frame generation is off on the PS5 for now (it made no frames
-  // and broke the radar), and the in-game menu's graphics rows are gone (the
-  // hub has the PS5's own): anything they set before goes back to default.
+  // [ps5 port] Frame generation is off on the PS5 (it made no frames: every
+  // frame short of motion vectors), and the in-game menu's graphics rows are
+  // gone (the hub has the PS5's own): anything they set before goes back to
+  // default.
+  REXCVAR_SET(ps5_frame_generation, "off");
   REXCVAR_SET(gta4_native_frame_generation, "off");
   for (const char* name : {"gta4_native_upscaler", "gta4_fsr1_quality", "gta4_present_mode", "gta4_aspect_ratio",
                            "gta4_native_hdr_mode", "gta4_native_hdr_paper_white_nits", "gta4_native_hdr_peak_nits",

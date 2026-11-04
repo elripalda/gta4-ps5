@@ -3090,6 +3090,16 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   gpu_flight::Record("present.queue-begin", uint64_t(uintptr_t(paint_context_.swapchain)),
                      current_paint_submission_index, tv_trace_provenance.submitted_frame,
                      swapchain_image_index, uint64_t(uintptr_t(present_semaphore)));
+#if REX_PLATFORM_PS5
+  // (the TV's previous image its full time first: ps5_display.cpp)
+  if (auto* before_present = rex::frame_stats::g_before_present.load(std::memory_order_acquire)) {
+    static uint64_t last_publication = 0;
+    const uint64_t publication = guest_output_properties.provenance.publication_serial;
+    rex::frame_stats::g_present_new_frame.store(publication != last_publication, std::memory_order_release);
+    last_publication = publication;
+    before_present();
+  }
+#endif
   {
     const VulkanDevice::Queue::Acquisition queue_acquisition =
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);

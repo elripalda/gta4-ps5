@@ -29,7 +29,7 @@ bool Readable(uint8_t* base, uint32_t address, uint32_t offset, uint32_t bytes,
   auto* memory = runtime ? runtime->memory() : nullptr;
   auto* heap = memory ? memory->LookupHeap(static_cast<uint32_t>(begin)) : nullptr;
   if (!heap || heap != memory->LookupHeap(static_cast<uint32_t>(end)) ||
-      heap->QueryRangeAccess(static_cast<uint32_t>(begin), static_cast<uint32_t>(end)) ==
+      heap->QueryRangeAccessUnlocked(static_cast<uint32_t>(begin), static_cast<uint32_t>(end)) ==
           rex::memory::PageAccess::kNoAccess) {
     return false;
   }

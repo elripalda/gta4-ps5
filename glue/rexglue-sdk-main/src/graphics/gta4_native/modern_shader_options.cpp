@@ -1,3 +1,4 @@
+#include "cached_cvar.h"
 #include "modern_shader_options.h"
 #include "modern_shader_diagnostics.h"
 #include <rex/cvar.h>
@@ -14,14 +15,14 @@ REXCVAR_DEFINE_BOOL(gta4_trace_modern_shader_gpu, false, "GTA IV/Diagnostics",
 
 namespace rex::graphics::gta4_native {
 ModernShaderSettings ReadModernShaderSettings() {
-  return {rex::cvar::Query<bool>("gta4_modern_shaders"),
-          rex::cvar::Query<bool>("gta4_disable_tlad_film_grain")};
+  return {CachedQuery<bool>("gta4_modern_shaders"),
+          CachedQuery<bool>("gta4_disable_tlad_film_grain")};
 }
 bool ModernShaderTraceEnabled() {
-  return rex::cvar::Query<bool>("gta4_trace_modern_shaders") || ModernShaderGpuProbeEnabled() ||
+  return CachedQuery<bool>("gta4_trace_modern_shaders") || ModernShaderGpuProbeEnabled() ||
       rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeTrace);
 }
-bool ModernShaderGpuProbeEnabled() { return rex::cvar::Query<bool>("gta4_trace_modern_shader_gpu"); }
+bool ModernShaderGpuProbeEnabled() { return CachedQuery<bool>("gta4_trace_modern_shader_gpu"); }
 }  // namespace rex::graphics::gta4_native
 
 namespace rex::graphics::gta4_native {

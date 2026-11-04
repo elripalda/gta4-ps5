@@ -4,6 +4,7 @@
 #endif
 #include <rex/graphics/gta4_native/fusion_tone_lut.h>
 #include <rex/graphics/gta4_native/modern_effect_constants.h>
+#include "cached_cvar.h"
 #include "core/font_atlas.h"
 #include "native_profile_labels.h"
 #include "graphics_system.h"
@@ -309,10 +310,18 @@ REXCVAR_DEFINE_BOOL(gta4_native_fg_motion_audit, !REX_PLATFORM_PS5, "GTA IV/Grap
 // generated), with their shaders, so one test session names them.
 static void NoteFgMotionLost(const char* why, const void* vertex_shader, const void* pixel_shader,
                              uint64_t vertex_hash, uint64_t pixel_hash) {
-  static std::atomic<uint32_t> logged{0};
-  if (!rex::frame_stats::g_frame_generation_active.load(std::memory_order_relaxed) ||
-      logged.fetch_add(1, std::memory_order_relaxed) >= 16)
-    return;
+  // (each shader pair and reason once, up to 48: one draw can hide the next)
+  static std::mutex mutex;
+  static std::vector<std::pair<uint64_t, const char*>> seen;
+  if (!rex::frame_stats::g_frame_generation_active.load(std::memory_order_relaxed)) return;
+  const uint64_t key = (vertex_shader ? vertex_hash : 0) * 31 ^ (pixel_shader ? pixel_hash : 0);
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (seen.size() >= 48) return;
+    for (const auto& [k, w] : seen)
+      if (k == key && w == why) return;
+    seen.emplace_back(key, why);
+  }
   REXLOG_INFO("ps5 frame generation: motion lost at a draw ({}): vertex shader {:016X}, pixel shader {:016X}", why,
               vertex_shader ? vertex_hash : 0, pixel_shader ? pixel_hash : 0);
 }
@@ -470,6 +479,9 @@ REXCVAR_DEFINE_STRING(ps5_lean_capture, "on", "PS5",
 // on the frames in between, the environment reflection map (car paint, glass)
 // is not redrawn and keeps the last one; its commands never reach the renderer.
 // Every other frame by default on the PS5 (hard to tell apart in motion).
+REXCVAR_DEFINE_BOOL(ps5_fg_hud_alpha_guard, true, "PS5",
+                    "Frame generation: a frame whose HUD blends with the screen's alpha (the radar) is shown as "
+                    "the game drew it, without a generated frame");
 REXCVAR_DEFINE_UINT32(ps5_environment_reflection_every, REX_PLATFORM_PS5 ? 2 : 1, "PS5",
                       "Redraw the environment reflection map (cars, glass) every Nth frame")
     .range(1, 4);
@@ -4370,8 +4382,8 @@ bool Gta4NativeGraphicsSystem::ExecuteTitleCommand(uint32_t title_id, uint32_t a
     }
     std::lock_guard lock(temporal_provider_mutex_);
     const auto aa = ResolveAntiAliasingConfiguration(
-        rex::cvar::Query<std::string>("gta4_native_anti_aliasing"), REXCVAR_GET(gta4_native_msaa),
-        REXCVAR_GET(gta4_native_spatial_aa), rex::cvar::Query<bool>("gta4_native_anti_aliasing_unified"));
+        CachedQuery<std::string>("gta4_native_anti_aliasing"), REXCVAR_GET(gta4_native_msaa),
+        REXCVAR_GET(gta4_native_spatial_aa), CachedQuery<bool>("gta4_native_anti_aliasing_unified"));
     const auto route = GetAntiAliasingRoute(aa.mode);
     if (route.scene_sample_count != 1 || route.supersampling_pixel_factor != 1) {
       answer.status = TemporalUpscalerStatus::kUnsupportedQuality;
@@ -6935,8 +6947,8 @@ void Gta4NativeGraphicsSystem::BeginModernShaderFrame() {
   postfx_filtered_scene_.reset();
   // Registry queries synchronize with frontend writers. One complete title
   // frame sees one filtering policy; no per-draw string copies or mixed modes.
-  const auto filtering = rex::cvar::Query<std::string>("gta4_texture_filtering");
-  const auto anisotropy = rex::cvar::Query<std::string>("gta4_anisotropic_filtering");
+  const auto filtering = CachedQuery<std::string>("gta4_texture_filtering");
+  const auto anisotropy = CachedQuery<std::string>("gta4_anisotropic_filtering");
   if (filtering != active_texture_filtering_) {
     active_texture_filtering_ = filtering; texture_filtering_trace_pending_ = true;
   }
@@ -8053,7 +8065,7 @@ void Gta4NativeGraphicsSystem::UpdateDynamicDrawDistance() {
   // between 1.0 and the minimum every ~30 s: it now drops only while two
   // windows in a row miss the 30 Hz target clearly, in small spaced steps,
   // and climbs back once the last three seconds average near the target.
-  if (rex::cvar::GetFlagByName("gta4_dynamic_draw_distance") != "true") {
+  if (CachedFlagByName("gta4_dynamic_draw_distance") != "true") {
     dynamic_draw_distance_factor_ = 1.0;
     return;
   }
@@ -8068,7 +8080,7 @@ void Gta4NativeGraphicsSystem::UpdateDynamicDrawDistance() {
       dynamic_draw_distance_interval_ms_ * 0.9 + std::min(interval_ms, 100.0) * 0.1;
   double minimum = 0.7;
   try {
-    minimum = std::clamp(std::stod(rex::cvar::GetFlagByName("gta4_dynamic_draw_distance_min")), 0.25, 1.0);
+    minimum = std::clamp(std::stod(CachedFlagByName("gta4_dynamic_draw_distance_min")), 0.25, 1.0);
   } catch (...) {
   }
   double factor = dynamic_draw_distance_factor_;
@@ -29893,7 +29905,7 @@ bool Gta4NativeGraphicsSystem::RecordPresent(
       return false;
     }
     const SmaaQuality quality =
-        ParseSmaaQuality(rex::cvar::Query<std::string>("gta4_native_smaa_quality"));
+        ParseSmaaQuality(CachedQuery<std::string>("gta4_native_smaa_quality"));
     smaa_applied = smaa_pipeline_.Record(
         command_buffer, vulkan_device, frame_descriptor_pool_, native_pipeline_cache_,
         shader_source_image, shader_source_view, *shader_source_layout,
@@ -30022,19 +30034,19 @@ bool Gta4NativeGraphicsSystem::RecordPresent(
       constants.destination_height = int32_t(presenter_height);
       constants.hdr_headroom = std::max(1.0f, hdr_headroom);
       const auto configured_hdr_mode = rex::graphics::gta4_native::ParseHdrMode(
-          rex::cvar::GetFlagByName("gta4_native_hdr_mode"));
+          CachedFlagByName("gta4_native_hdr_mode"));
       const auto effective_hdr_mode =
           hdr_output ? configured_hdr_mode.value_or(rex::graphics::gta4_native::HdrMode::kScRgb)
                      : rex::graphics::gta4_native::HdrMode::kOff;
       constants.hdr_mode = uint32_t(effective_hdr_mode);
       constants.paper_white_nits = static_cast<float>(
-          std::clamp(rex::cvar::Query<double>("gta4_native_hdr_paper_white_nits"), 80.0, 500.0));
+          std::clamp(CachedQuery<double>("gta4_native_hdr_paper_white_nits"), 80.0, 500.0));
       constants.peak_nits = static_cast<float>(
-          std::clamp(rex::cvar::Query<double>("gta4_native_hdr_peak_nits"), 80.0, 2000.0));
+          std::clamp(CachedQuery<double>("gta4_native_hdr_peak_nits"), 80.0, 2000.0));
       constants.shoulder_start = static_cast<float>(
-          std::clamp(rex::cvar::Query<double>("gta4_native_auto_hdr_shoulder_start"), 0.0, 1.0));
+          std::clamp(CachedQuery<double>("gta4_native_auto_hdr_shoulder_start"), 0.0, 1.0));
       constants.shoulder_power = static_cast<float>(
-          std::clamp(rex::cvar::Query<double>("gta4_native_auto_hdr_shoulder_power"), 1.0, 10.0));
+          std::clamp(CachedQuery<double>("gta4_native_auto_hdr_shoulder_power"), 1.0, 10.0));
       const uint32_t aa_bits = temporal_resolved_ ? 0 : GetNativePresentationAABits();
       const uint32_t ssaa_bits = ssaa_applied ? 32u : 0u;
       constants.output_mode = (hdr_output ? 1u : 0u) | aa_bits | ssaa_bits | 4u |
@@ -30056,7 +30068,7 @@ bool Gta4NativeGraphicsSystem::RecordPresent(
               constants.shoulder_power, aa_bits, bool(ssaa_bits), constants.output_mode));
       }
       if (!aa_bits && !ssaa_bits &&
-          rex::cvar::Query<std::string>("gta4_native_upscaler") == "fsr1") {
+          CachedQuery<std::string>("gta4_native_upscaler") == "fsr1") {
         static std::atomic<bool> logged_fsr_without_aa{false};
         if (!logged_fsr_without_aa.exchange(true)) {
           REXLOG_WARN(
@@ -39469,7 +39481,7 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutput(
           // shows the generated and the real image on consecutive vblanks.
           .frame_rate_limit = REX_PLATFORM_PS5 && REXCVAR_GET(ps5_decoupled_presentation)
                                   ? 0u
-                                  : rex::cvar::Query<uint32_t>("gta4_frame_limit"),
+                                  : CachedQuery<uint32_t>("gta4_frame_limit"),
 
           // (Frame generation pairs frames through this hold: kept for it.)
           .producer_backpressure = present.device != 0 &&

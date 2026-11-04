@@ -368,6 +368,13 @@ class Presenter {
   Presenter& operator=(const Presenter& presenter) = delete;
   virtual ~Presenter();
 
+#if REX_PLATFORM_PS5
+  // [ps5 port] From any thread: one paint of the frame already on the TV,
+  // past the guard that otherwise skips those while the game publishes (a
+  // refresh timed by ps5_display.cpp while the game is behind).
+  void RequestKeepAlivePaint();
+#endif
+
   virtual Surface::TypeFlags GetSupportedSurfaceTypes() const = 0;
 
   // For calling from the Window for the Presenter attached to it.
@@ -928,6 +935,10 @@ class Presenter {
   void PaintFromUIThreadImpl(bool force_paint, bool display_opportunity);
   bool ui_paint_pending_ = true;  // UI owner; callbacks do not manufacture work.
   PublicationProgress publication_progress_;
+  // [ps5 port] When the game last published a frame (FramePacerNowNs), for
+  // telling a repaint of the frame already on the TV from one that's needed.
+  std::atomic<uint64_t> last_active_publication_ns_{0};
+  std::atomic<bool> keepalive_requested_{false};
 
   void HandleUIDrawersChangeFromUIThread(bool drawers_were_empty);
   void InvalidateGuestOutputTransform() const;

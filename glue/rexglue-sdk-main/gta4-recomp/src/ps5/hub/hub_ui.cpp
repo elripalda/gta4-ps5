@@ -25,7 +25,7 @@ namespace fs = std::filesystem;
 using lang::F;
 using lang::T;
 
-static const char* const kTabNames[kTabCount] = {"Home", "Display", "Game", "Episodes", "Saves", "Trophies", "About", "Debug"};
+static const char* const kTabNames[kTabCount] = {"Home", "Display", "Game", "Episodes", "Saves", "About", "Debug", "Trophies"};
 
 namespace {
 
@@ -145,16 +145,20 @@ static const std::vector<Hub::Setting>& Settings() {
        "everywhere; 60 runs at 50 to 60 in the busiest streets. 40 and 120 are for a 120 Hz Refresh Rate: "
        "40 holds steady and is smoother than 30; 120 is only reached in quieter places.",
        false, {"30", "40", "60", "120"}, {"30 FPS", "40 FPS", "60 FPS", "120 FPS"}, "60"},
+      {"DISPLAY", "ps5_smooth_40", "Smooth Heavy Areas", nullptr,
+       "With a 120 Hz Refresh Rate and a 60 FPS limit: in the busiest places, where 60 can't hold, the game "
+       "switches to a steady 40 FPS instead of bouncing between 40 and 60, and goes back to 60 when it can.",
+       false, {"true", "false"}, {"On", "Off"}, "false"},
       // (game/ps5_overlay.cpp)
       {"DISPLAY", "ps5_fps_counter", "FPS Counter", nullptr,
        "Shows the frame rate at the left edge of the screen while you play. Simple is frames a second and the "
        "frame time. Detailed adds the slowest frames, a graph of the last ones, the resolution, the TV's refresh "
        "rate, the frame limit and how long the renderer takes.",
        true, {"false", "simple", "true"}, {"Off", "Simple", "Detailed"}, "false"},
-// (Frame Generation: off and its row gone until it makes frames on the PS5;
-// it broke the radar and made no frames in 1.0.1's tests)
+// (Frame Generation: off and its row gone until it makes frames on the PS5:
+// 1.0.3 Test 4 still made none, every frame short of motion vectors)
 #if LIBERTY_HAS_FSR3 && LIBERTY_PS5_FRAME_GENERATION
-      {"DISPLAY", "ps5_frame_generation", "Frame Generation", nullptr,
+      {"DISPLAY", "ps5_frame_generation", "Frame Generation (Experimental)", nullptr,
        "AMD FSR 3 adds a frame between each two the game draws. 30 to 60 holds the game at 30 FPS and shows "
        "60, on any TV. 60 to 120 needs a 120 Hz TV and switches to it: the game runs at 60 and shows 120, "
        "and drops to 30 to 60 by itself in places it can't hold 60. Frame Limit doesn't apply while it's on. "
@@ -228,6 +232,11 @@ static const std::vector<Hub::Setting>& Settings() {
        "How quickly the car camera swings round to follow the car through turns and back behind it. "
        "Original is the Xbox 360's.",
        false, {"0", "2", "4", "6"}, {"Original", "Faster", "Much Faster", "Fastest"}, "0"},
+      // (trophies_native/native_trophies.cpp: RecompTrophy's set, relay and watcher)
+      {"GAME", "ps5_trophies", "PS5 Trophies", nullptr,
+       "Adds the game's trophies to the PS5's own Trophies list, with the ones you've already earned, and shows "
+       "the PS5's trophy pop-ups as you earn them. Needs a payload loader (etaHEN, elfldr...).",
+       false, {"false", "true"}, {"Off", "On"}, "true"},
       {"CONTROLS", "gta4_sony_enabled", "DualSense Features", nullptr,
        "Turns the controller extras below on or off together: the light bar, adaptive triggers and extra rumble.",
        false, {"false", "true"}, {"Off", "On"}, "true"},
@@ -297,6 +306,11 @@ static const std::vector<Hub::Setting>& Settings() {
        "Re-reads textures that change in memory without the game saying so. Off brings back the wrong map and "
        "radar tiles. Only for comparing performance.",
        false, {"true", "false"}, {"On", "Off"}, "true"},
+      // (gta4_native_hooks.cpp: Ps5LimitFrameRate)
+      {"DEBUG", "ps5_cutscene_30", "Cutscenes at 30", nullptr,
+       "Holds the game at 30 FPS during cutscenes and loading screens, as on the Xbox 360. Some missions, like "
+       "Lure, get stuck on a loading screen when their cutscenes run faster. Off is only for comparing.",
+       false, {"true", "false"}, {"On", "Off"}, "true"},
       // (gta4_native/graphics_system.cpp: lights that go dark near the camera)
       {"DEBUG", "ps5_light_test", "Light Test", nullptr,
        "For lights that go dark close to the camera, like in tunnels or over the pool table. No Stencil lets "
@@ -333,10 +347,13 @@ void Hub::Load() {
     config_.emplace_back(k, v);
   }
   lang::Set(lang::FromSetting(Value("ps5_language", "auto")));
-  debug_options_ = Value("hub_debug_options", "false") == "true";
+  // [ps5 port] 1.1: the Debug page is closed at every start (About: hold
+  // Cross to open it for this session): its settings back to their defaults.
+  debug_options_ = false;
+  if (Value("hub_debug_options", "false") != "false") Save("hub_debug_options", "false");
   KeepHiddenSettings();
   LoadSaves();
-  LoadTrophies();
+  // (no Trophies tab since 1.1: not loaded)
   // (the game's files come from Recomp Store: only whether they're there)
   state_ = install::Look(paths_.app);
 }
@@ -1806,12 +1823,14 @@ void Hub::DrawAbout() {
       {"@elripalda", "Brought it to PlayStation 5: the PS5 port and this hub."},
       {"vaduur", "LibertyRecompAndroid: the fixes for running it on handheld hardware."},
       {"ReXGlue", "The static recompiler and runtime that turn the Xbox 360 game into a native program."},
+      {"lamarking", "RecompTrophy: the native PS5 trophies and their pop-ups."},
   };
+  // (five now: a little closer together, to fit above the footer)
   float y = kListY + 6;
   for (const Credit& c : people) {
     TextMid(Bold(), 35, kListX, y + 18, kText, c.who);
-    y += 46;
-    y += Wrapped(Regular(), 28, kListX, y, 860, kMenuGray, T(c.what), 1.35f) + 30;
+    y += 42;
+    y += Wrapped(Regular(), 28, kListX, y, 860, kMenuGray, T(c.what), 1.35f) + 22;
   }
   const float px = kPanelX;
   float py = kPanelY + 4;
