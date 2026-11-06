@@ -63,6 +63,7 @@
 #include "native_attachment_policy.h"
 #include "native_binding_policy.h"
 #include "native_descriptor_backend.h"
+#include "native_capture_ring.h"
 #include "native_draw_state_cache.h"
 #include "native_frame_context.h"
 #include "native_frame_scheduling.h"
@@ -3083,6 +3084,67 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   // The Renderer Threads mask each thread last applied (FollowRendererCpuMask).
   uint64_t worker_cpu_mask_applied_ = 0;
   uint64_t recorder_cpu_mask_applied_ = 0;
+  uint64_t capture_cpu_mask_applied_ = 0;
+  // [ps5 port] Capture on its own core (capture_thread.inc). The game's render
+  // thread copies each command, with the device state lines it changed since
+  // the last draw, into capture_ring_; the capture thread keeps a copy of each
+  // device (capture_shadows_) up to date from them and runs the capture the
+  // render thread used to run, reading that copy instead of guest memory.
+  struct CaptureDeviceCopy {
+    uint32_t device = 0;
+    bool primed = false;
+    alignas(64) std::array<uint8_t, kGuestDeviceSize> bytes{};
+  };
+  int SubmitTitleCommandOnCore(const void* command, size_t command_size);
+  // (shadow_device/shadow/up_payload: from the capture thread, installed once
+  // the capture lock is held, for that one command)
+  bool SubmitTitleCommandHere(uint32_t title_id, uint32_t abi_version, const void* command,
+                              size_t command_size, uint32_t shadow_device = 0,
+                              const uint8_t* shadow = nullptr, const uint8_t* up_payload = nullptr,
+                              const uint8_t* objects = nullptr, uint32_t object_count = 0);
+  void FinishCaptureOnCore();  // every command submitted so far has been captured
+  void CaptureThreadMain();
+  void StopCaptureThread();
+  CaptureDeviceCopy& CaptureMirror(uint32_t device);
+  CaptureDeviceCopy& CaptureShadow(uint32_t device);
+  const uint8_t* CaptureDeviceMemory(uint32_t device) const {
+    return device && device == capture_shadow_device_ ? capture_shadow_memory_
+                                                      : memory_->TranslateVirtual<const uint8_t*>(device);
+  }
+  std::unique_ptr<NativeCaptureRing> capture_ring_;
+  std::atomic<NativeCaptureRing*> capture_ring_published_{nullptr};  // (for StopCaptureThread, lock-free)
+  std::thread capture_thread_;
+  std::atomic<bool> capture_thread_running_{false};
+  // The submitters' side (capture_push_mutex_): whether commands go to the
+  // ring, and each device's lines as last sent.
+  CaptureMutex capture_push_mutex_;
+  bool capture_on_core_ = false;
+  bool capture_stopped_ = false;  // StopCaptureThread ran
+  std::atomic<bool> capture_on_core_flag_{false};  // capture_on_core_, readable without the lock
+  std::vector<std::unique_ptr<CaptureDeviceCopy>> capture_mirrors_;
+  CaptureDeviceCopy* capture_last_mirror_ = nullptr;
+  // The capture thread's side.
+  std::vector<std::unique_ptr<CaptureDeviceCopy>> capture_shadows_;
+  CaptureDeviceCopy* capture_last_shadow_ = nullptr;
+  uint32_t capture_shadow_device_ = 0;
+  const uint8_t* capture_shadow_memory_ = nullptr;
+  const uint8_t* capture_up_payload_ = nullptr;
+  // The bound surfaces' and buffers' guest objects as they were at the draw
+  // (handle, then the object's first kCaptureObjectBytes): the game re-points
+  // its render target objects from pass to pass.
+  static constexpr uint32_t kCaptureObjectBytes = 44;
+  static constexpr uint32_t kCaptureObjectEntry = 48;
+  const uint8_t* capture_objects_ = nullptr;
+  uint32_t capture_object_count_ = 0;
+  const uint8_t* CaptureObjectMemory(uint32_t handle) const {
+    for (uint32_t i = 0; i < capture_object_count_; ++i) {
+      const uint8_t* entry = capture_objects_ + size_t(i) * kCaptureObjectEntry;
+      uint32_t entry_handle;
+      std::memcpy(&entry_handle, entry, sizeof(entry_handle));
+      if (entry_handle == handle) return entry + 4;
+    }
+    return memory_->TranslateVirtual<const uint8_t*>(handle);
+  }
   uint32_t ps5_memory_short_frames_ = 0;
   void NotePs5MemoryShort(const char* what);
 #endif

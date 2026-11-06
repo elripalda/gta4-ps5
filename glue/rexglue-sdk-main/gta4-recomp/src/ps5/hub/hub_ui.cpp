@@ -277,11 +277,11 @@ static const std::vector<Hub::Setting>& Settings() {
        "two versions of Own Cores every 10 seconds and notes each in the log.",
        true, {"cores", "any", "compare"}, {"Own Cores", "Anywhere", "Compare"}, "cores"},
       {"DEBUG", "ps5_lean_capture", "Game Thread Capture", nullptr,
-       "How the game's render thread hands each draw to the renderer. Lean holds every buffer and "
-       "texture once for two frames instead of once per draw and fetches what a capture reads "
-       "ahead of time. Same picture either way. Compare stays on Lean and switches its fetching "
-       "ahead off and on every 10 seconds, noting each in the log.",
-       true, {"on", "off", "compare"}, {"Lean", "Classic", "Compare"}, "on"},
+       "How the game's render thread hands each draw to the renderer. Own Core gives that work to a "
+       "thread on a core of its own, so the game's thread only copies what changed and moves on. "
+       "Lean does it on the game's thread, holding every buffer and texture once for a few frames. "
+       "Compare switches between Own Core and Lean every 10 seconds and notes each in the log.",
+       true, {"on", "core", "off", "compare"}, {"Lean", "Own Core", "Classic", "Compare"}, "on"},
       {"DEBUG", "ps5_frametime_capture", "Frame Time Capture", nullptr,
        "Records every frame's time to a CSV file in /app0/logs, for checking stutter and slowdowns.", false,
        {"false", "true"}, {"Off", "On"}, "false"},
@@ -308,9 +308,9 @@ static const std::vector<Hub::Setting>& Settings() {
        false, {"true", "false"}, {"On", "Off"}, "true"},
       // (gta4_native_hooks.cpp: Ps5LimitFrameRate)
       {"DEBUG", "ps5_cutscene_30", "Cutscenes at 30", nullptr,
-       "Holds the game at 30 FPS during cutscenes and loading screens, as on the Xbox 360. Some missions, like "
-       "Lure, get stuck on a loading screen when their cutscenes run faster. Off is only for comparing.",
-       false, {"true", "false"}, {"On", "Off"}, "true"},
+       "Holds the game at 30 FPS during cutscenes and loading screens, as on the Xbox 360. Off plays them at "
+       "the full frame rate.",
+       false, {"false", "true"}, {"Off", "On"}, "false"},
       // (gta4_native/graphics_system.cpp: lights that go dark near the camera)
       {"DEBUG", "ps5_light_test", "Light Test", nullptr,
        "For lights that go dark close to the camera, like in tunnels or over the pool table. No Stencil lets "

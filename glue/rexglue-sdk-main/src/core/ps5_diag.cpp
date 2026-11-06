@@ -532,7 +532,9 @@ void KeepOtherThreadsOn(uint64_t mask, uintptr_t title_thread, uintptr_t main_th
   for (int i = 0; i < count; ++i) {
     ThreadEntry& e = threads[i];
     if (!e.used.load(std::memory_order_acquire)) continue;
-    if (!std::strcmp(e.what, "worker") || !std::strcmp(e.what, "recorder")) continue;
+    if (!std::strcmp(e.what, "worker") || !std::strcmp(e.what, "recorder") ||
+        !std::strcmp(e.what, "capture"))
+      continue;
     if (reinterpret_cast<uintptr_t>(e.pthread) == title_thread) continue;
     const bool main = main_thread && reinterpret_cast<uintptr_t>(e.pthread) == main_thread;
     const uint64_t want = main && main_mask ? main_mask : mask;

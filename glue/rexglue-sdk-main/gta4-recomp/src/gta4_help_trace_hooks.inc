@@ -225,7 +225,9 @@ void HelpImmediate(PPCContext& ctx, uint8_t* base, const char* kind, uint32_t co
 }  // namespace
 
 void GTA4_HelpTraceFinalize(uint8_t* base, uint32_t dc, uint32_t caller) {
-  if (!g_help_call || !dc) return;
+  // [ps5 port] Every draw command the main thread finishes: the trace's
+  // switch first, not the thread-local (a call on the PS5).
+  if (!dc || !HelpEnabled() || !g_help_call) return;
   HelpBackground bg;
   {
     std::lock_guard lock(g_help_dc_mutex);

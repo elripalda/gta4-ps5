@@ -174,7 +174,7 @@ class TitleWaitScope {
 
 // [ps5 port] The CPUs the renderer's threads ran on since the last timing
 // line (a bit per CPU), and the CPUs they are kept on (0: anywhere).
-inline std::atomic<uint32_t> g_cpus_title{0}, g_cpus_worker{0}, g_cpus_recorder{0};
+inline std::atomic<uint32_t> g_cpus_title{0}, g_cpus_worker{0}, g_cpus_recorder{0}, g_cpus_capture{0};
 inline std::atomic<uint64_t> g_renderer_cpu_mask{0};
 // The CPUs a game thread may use (13 of the 16), and the first cluster's 8.
 inline constexpr uint64_t kGameCpus = 0x1FFF, kFirstClusterCpus = 0xFF;
@@ -198,24 +198,41 @@ inline constexpr uint64_t kTitleCpu = 1u << 0, kRecorderCpu = 1u << 2, kWorkerCp
 inline constexpr uint64_t kOtherThreadCpus = kGameCpus & ~uint64_t(0x1F);
 // The main thread's own core, under Own Cores (off; see above).
 inline std::atomic<bool> g_main_core{false};
+// Capture on its own core (Game Thread Capture "Own Core"): the capture thread
+// takes CPU 6 (8 with the main thread's own core), which the other threads
+// then leave to it; its core's other hardware thread stays theirs.
+inline std::atomic<bool> g_capture_on_core{false};
+inline std::atomic<bool> g_capture_core_compare{false};
+// Whether the capture thread's CPU is kept for it: set once at start (Own Core
+// or Compare), not with Compare's turns, so the other threads aren't moved
+// every 10 s (moving them was what 0.6b2's frozen sessions had in common).
+inline std::atomic<bool> g_capture_cpu_reserved{false};
+inline uint64_t CaptureCpu() {
+  return g_main_core.load(std::memory_order_relaxed) ? uint64_t(1) << 8 : uint64_t(1) << 6;
+}
+// Time the game's render thread waited for room in the capture ring, or for
+// the capture thread to finish a frame it was still capturing (renderer time).
+inline std::atomic<uint64_t> g_capture_ring_wait_us{0};
 inline bool IsOwnCoresLayout(uint64_t layout) {
   return layout == kOwnCoresLayout || layout == kOwnCoresApartLayout;
 }
-enum class RendererRole { kTitle, kWorker, kRecorder, kRetirer, kMain, kOther };
+enum class RendererRole { kTitle, kWorker, kRecorder, kRetirer, kMain, kOther, kCapture };
 // The CPUs one thread is kept on under a layout (0: anywhere).
 inline uint64_t RendererRoleMask(uint64_t layout, RendererRole role) {
   if (IsOwnCoresLayout(layout)) {
     const uint64_t main_core = g_main_core.load(std::memory_order_relaxed) ? kMainCoreCpus : 0;
+    const uint64_t capture = g_capture_cpu_reserved.load(std::memory_order_relaxed) ? CaptureCpu() : 0;
     switch (role) {
       case RendererRole::kTitle: return kTitleCpu;
       case RendererRole::kRecorder: return kRecorderCpu;
       case RendererRole::kWorker: return kWorkerCpu;
+      case RendererRole::kCapture: return CaptureCpu();
       case RendererRole::kRetirer:
-        return (layout == kOwnCoresLayout ? kRetirerCpus : kOtherThreadCpus) & ~main_core;
+        return (layout == kOwnCoresLayout ? kRetirerCpus : kOtherThreadCpus) & ~main_core & ~capture;
       case RendererRole::kMain:
         if (main_core) return kMainCpu;
-        return kOtherThreadCpus;
-      default: return kOtherThreadCpus & ~main_core;
+        return kOtherThreadCpus & ~capture;
+      default: return kOtherThreadCpus & ~main_core & ~capture;
     }
   }
   if ((role == RendererRole::kOther || role == RendererRole::kMain) && layout != kFirstClusterCpus)

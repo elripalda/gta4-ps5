@@ -471,10 +471,13 @@ REXCVAR_DEFINE_STRING(ps5_renderer_cpus, "cores", "PS5",
 // on a cache line the other renderer threads also write), and the lines a
 // capture touches are fetched ahead. Same commands, same pictures; classic is
 // the method before it, kept for comparison.
+// Own core (core): lean, run by a capture thread on a core of its own, the
+// game's thread only copying each command and what it changed into a ring
+// (capture_thread.inc). Compare: own core and lean in turn, 10 s each.
 REXCVAR_DEFINE_STRING(ps5_lean_capture, "on", "PS5",
-                      "Game thread capture: lean (on), classic (off), or compare (lean, its extra "
-                      "prefetching off and on in turn, 10 s each, for the timing report)")
-    .allowed({"on", "off", "compare"});
+                      "Game thread capture: on its own core (core), lean (on), classic (off), or "
+                      "compare (own core and lean in turn, 10 s each, for the timing report)")
+    .allowed({"core", "on", "off", "compare"});
 // [ps5 port] Read by the draw, clear and resolve hooks (gta4_native_hooks.cpp):
 // on the frames in between, the environment reflection map (car paint, glass)
 // is not redrawn and keeps the last one; its commands never reach the renderer.
@@ -4064,6 +4067,10 @@ uint32_t Gta4NativeGraphicsSystem::GetTitleCommandAbi(uint32_t title_id) const {
   return title_id == kTitleId ? kTitleCommandAbi : 0;
 }
 
+#if REX_PLATFORM_PS5
+#include "capture_thread.inc"
+#endif
+
 void Gta4NativeGraphicsSystem::PublishStagedDrawCommandsLocked() {
   for (auto& staged : staged_draw_commands_) {
     staged->diagnostic_submit_sequence = ++diagnostic_submit_sequence_;
@@ -4073,8 +4080,17 @@ void Gta4NativeGraphicsSystem::PublishStagedDrawCommandsLocked() {
   staged_draw_commands_.clear();
 }
 
+#if REX_PLATFORM_PS5
+// (SubmitTitleCommand itself: capture_thread.inc)
+bool Gta4NativeGraphicsSystem::SubmitTitleCommandHere(uint32_t title_id, uint32_t abi_version,
+                                                      const void* command, size_t command_size,
+                                                      uint32_t shadow_device, const uint8_t* shadow,
+                                                      const uint8_t* up_payload, const uint8_t* objects,
+                                                      uint32_t object_count) {
+#else
 bool Gta4NativeGraphicsSystem::SubmitTitleCommand(uint32_t title_id, uint32_t abi_version,
                                                   const void* command, size_t command_size) {
+#endif
   if (title_id != kTitleId || !command || !memory_) {
     return false;
   }
@@ -4121,6 +4137,29 @@ bool Gta4NativeGraphicsSystem::SubmitTitleCommand(uint32_t title_id, uint32_t ab
        g_native_profile_capture_requested.load(std::memory_order_acquire));
   const uint64_t capture_begin = profile_transport ? profile::CpuTick() : 0;
   std::unique_lock capture_lock(command_capture_mutex_);
+#if REX_PLATFORM_PS5
+  // [ps5 port] The capture thread's copy of the device and the payload it was
+  // sent, for this command only (another thread's capture never sees them).
+  struct CaptureCopyScope {
+    Gta4NativeGraphicsSystem& self;
+    CaptureCopyScope(Gta4NativeGraphicsSystem& s, uint32_t device, const uint8_t* copy, const uint8_t* up,
+                     const uint8_t* objects, uint32_t object_count)
+        : self(s) {
+      self.capture_shadow_device_ = copy ? device : 0;
+      self.capture_shadow_memory_ = copy;
+      self.capture_up_payload_ = up;
+      self.capture_objects_ = objects;
+      self.capture_object_count_ = objects ? object_count : 0;
+    }
+    ~CaptureCopyScope() {
+      self.capture_shadow_device_ = 0;
+      self.capture_shadow_memory_ = nullptr;
+      self.capture_up_payload_ = nullptr;
+      self.capture_objects_ = nullptr;
+      self.capture_object_count_ = 0;
+    }
+  } capture_copy_scope(*this, shadow_device, shadow, up_payload, objects, object_count);
+#endif
   const uint64_t capture_acquired = profile_transport ? profile::CpuTick() : 0;
   ++title_commands_submitted_;
   if (!phone_envelope && !tv_envelope && !fire_envelope && !profile_transport &&
@@ -4265,7 +4304,9 @@ bool Gta4NativeGraphicsSystem::SubmitTitleCommand(uint32_t title_id, uint32_t ab
              (render_queue_.size() < kMaximumQueuedCommands && queued_title_presents_ < MaxQueuedTitlePresents());
     });
 #if REX_PLATFORM_PS5
-    if (producer_wait_begin_ns)  // the game held up by the renderer (a full queue)
+    // the game held up by the renderer (a full queue); on the capture thread,
+    // the game waits on the ring instead (counted there)
+    if (producer_wait_begin_ns && !t_capture_thread)
       rex::frame_stats::NoteTitleSlotWait(uint64_t(rex::frame_stats::NowNs() - producer_wait_begin_ns) / 1000);
 #endif
     const uint64_t backpressure_end = profile_transport ? profile::CpuTick() : 0;
@@ -4469,6 +4510,12 @@ bool Gta4NativeGraphicsSystem::ExecuteTitleCommand(uint32_t title_id, uint32_t a
     return false;
   }
 
+#if REX_PLATFORM_PS5
+  // [ps5 port] With capture on its own core: after everything the game
+  // submitted before it has been captured, and no other submission until done.
+  std::unique_lock<CaptureMutex> push_lock(capture_push_mutex_);
+  FinishCaptureOnCore();
+#endif
   std::unique_lock capture_lock(command_capture_mutex_);
   auto native_command_owner = native_command_pool_.Make();
   NativeCommand& native_command = *native_command_owner;
@@ -4640,6 +4687,13 @@ Gta4NativeGraphicsSystem::DecodeFixedFunctionState(std::span<const uint8_t> devi
   return state;
 }
 
+// [ps5 port] The device state the capture reads: on the capture thread, its
+// copy of the device (capture_thread.inc); otherwise the device itself.
+#if REX_PLATFORM_PS5
+#define CaptureDeviceMemoryOf(device) CaptureDeviceMemory(device)
+#else
+#define CaptureDeviceMemoryOf(device) memory_->TranslateVirtual<const uint8_t*>(device)
+#endif
 bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_t command_size,
                                                       NativeCommand& native_command) {
   auto reject = [command_size](CommandType type, const char* reason) {
@@ -5117,7 +5171,7 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
   if (draw_command || header.type == CommandType::kClear) {
     const uint32_t device = CommandDevice(header.type, command);
     const NativeDirtyState* dirty_state = CommandDirtyState(header.type, command);
-    const uint8_t* device_memory = memory_->TranslateVirtual<const uint8_t*>(device);
+    const uint8_t* device_memory = CaptureDeviceMemoryOf(device);
     if (!device_memory) {
       return reject(header.type, "device-state-translation");
     }
@@ -5342,7 +5396,13 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
       return reject(header.type, "up-payload-range");
     }
     if (draw.vertex_data_size) {
+#if REX_PLATFORM_PS5
+      // (on the capture thread: the copy the game's thread put in the ring)
+      const uint8_t* vertex_data = capture_up_payload_ ? capture_up_payload_
+                                                       : memory_->TranslateVirtual<const uint8_t*>(draw.vertex_data);
+#else
       const uint8_t* vertex_data = memory_->TranslateVirtual<const uint8_t*>(draw.vertex_data);
+#endif
       if (!vertex_data) {
         return reject(header.type, "up-payload-translation");
       }
@@ -5355,7 +5415,7 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
   } else if (header.type == CommandType::kDrawPrimitive ||
              header.type == CommandType::kDrawIndexedPrimitive) {
     const uint32_t device = CommandDevice(header.type, command);
-    const uint8_t* device_memory = memory_->TranslateVirtual<const uint8_t*>(device);
+    const uint8_t* device_memory = CaptureDeviceMemoryOf(device);
     if (!device_memory) {
       return reject(header.type, "vertex-state-translation");
     }
@@ -5433,7 +5493,7 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
       vertex_texture_mask |= state.memo_vertex_texture_mask;
     }
 
-    const uint8_t* device_memory = memory_->TranslateVirtual<const uint8_t*>(device);
+    const uint8_t* device_memory = CaptureDeviceMemoryOf(device);
     if (!device_memory) {
       return reject(header.type, "texture-state-translation");
     }
@@ -5709,7 +5769,11 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle, bool hold, bool
     return std::shared_ptr<const NativeBufferResource>{};
   };
 
+#if REX_PLATFORM_PS5
+  const uint8_t* object = CaptureObjectMemory(handle);  // (as at the draw, on the capture thread)
+#else
   const uint8_t* object = memory_->TranslateVirtual<const uint8_t*>(handle);
+#endif
   if (!object) {
     return reject("object-translation", 0, 0, 0);
   }
@@ -5992,7 +6056,11 @@ SurfaceDescriptor Gta4NativeGraphicsSystem::CaptureSurfaceDescriptor(uint32_t ha
   if (!handle) {
     return descriptor;
   }
+#if REX_PLATFORM_PS5
+  const uint8_t* object = CaptureObjectMemory(handle);  // (as at the draw, on the capture thread)
+#else
   const uint8_t* object = memory_->TranslateVirtual<const uint8_t*>(handle);
+#endif
   if (!object) {
     REXLOG_WARN("gta4-native-surface: unable to translate snapshot surface {:08X}", handle);
     return descriptor;
@@ -7024,7 +7092,12 @@ void Gta4NativeGraphicsSystem::RenderWorkerMain() {
   rex::frame_stats::FollowRendererCpuMask(worker_cpu_mask_applied_, rex::frame_stats::RendererRole::kWorker);
   rex::frame_stats::g_lean_capture.store(REXCVAR_GET(ps5_lean_capture) != "off",
                                          std::memory_order_relaxed);
-  rex::frame_stats::g_lean_capture_compare.store(REXCVAR_GET(ps5_lean_capture) == "compare",
+  rex::frame_stats::g_capture_on_core.store(REXCVAR_GET(ps5_lean_capture) == "core" ||
+                                                REXCVAR_GET(ps5_lean_capture) == "compare",
+                                            std::memory_order_relaxed);
+  rex::frame_stats::g_capture_core_compare.store(REXCVAR_GET(ps5_lean_capture) == "compare",
+                                                 std::memory_order_relaxed);
+  rex::frame_stats::g_capture_cpu_reserved.store(rex::frame_stats::g_capture_on_core.load(std::memory_order_relaxed),
                                                  std::memory_order_relaxed);
 #endif
   std::vector<std::pair<RenderPhase, uint32_t>> render_phase_stack;
@@ -39891,6 +39964,9 @@ void Gta4NativeGraphicsSystem::Shutdown() {
       render_worker_.join();
     }
   }
+#if REX_PLATFORM_PS5
+  StopCaptureThread();
+#endif
   ShutdownDeferredDiagnosticWorker();
 
   {

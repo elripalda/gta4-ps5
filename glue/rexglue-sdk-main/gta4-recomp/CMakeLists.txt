@@ -471,6 +471,7 @@ elseif(PS5)
         src/ps5/game/ps5_display.cpp
         src/ps5/game/ps5_overlay.cpp
         src/ps5/game/save_import.cpp
+        src/ps5/game/memory_watch.cpp
         src/ps5/trophies_native/native_trophies.cpp
         # RecompTrophy's (GPL-3.0, by lamarking, used with permission): the
         # game's PS5 trophy set; its payloads are ps5/payload/trophies
@@ -544,6 +545,11 @@ elseif(PS5)
     target_link_options(gta4 PRIVATE
         "LINKER:--wrap=sceVideoOutIsOutputSupported,--wrap=sceVideoOutConfigureOutput,--wrap=sceVideoOutSetFlipRate")
     rexglue_configure_target(gta4)
+    # With ThinLTO the program is linked (and its code generated) once, by
+    # ps5_package.sh; CMake's own link only names the output.
+    if(GTA4_PS5_THINLTO)
+        set_property(TARGET gta4 PROPERTY RULE_LAUNCH_LINK "${GTA4_PS5_DIR}/tools/ps5_skip_link.sh")
+    endif()
     # zlib for the installer's RPF extraction: the PS5 toolchain's static build.
     set(PS5_ZLIB_ROOT "${PS5_PAYLOAD_SDK}/../zlib/root/usr" CACHE PATH "PS5 zlib (include/, lib/libz.a)")
     target_include_directories(gta4 PRIVATE "${PS5_ZLIB_ROOT}/include")

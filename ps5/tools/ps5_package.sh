@@ -53,8 +53,16 @@ radv_link_recipe "$stage" "$sdk_root" "$radv_archive"
 # stat("") / lstat("") as on Linux (ps5_stat.c, through --wrap).
 "$sdk_root/bin/prospero-clang" -c -O2 -fno-visibility-from-dllstorageclass -o "$stage/build/ps5_stat.o" "$ps5dir/tools/ps5_stat.c"
 
+# ThinLTO (GTA4_PS5_THINLTO, the default): the link finishes the build, two
+# jobs at a time, with a cache so a change to one file redoes only what it
+# touches. The hottest game functions go first in the program, in the order
+# the Android port's profile found (lld leaves out names it doesn't have).
+lto_flags=(--thinlto-jobs="${PS5_LTO_JOBS:-2}" --thinlto-cache-dir="$stage/thinlto-cache" --lto-O3)
+order_file="$ps5dir/../glue/rexglue-sdk-main/gta4-recomp/android_symbol_order.txt"
+[[ -f $order_file ]] && lto_flags+=(--symbol-ordering-file="$order_file" --no-warn-symbol-ordering)
 link_pie() {  # extra objects, if any
     "$sdk_root/bin/prospero-lld" "${radv_linker_script[@]}" --eh-frame-hdr "${radv_link_flags[@]}" \
+        "${lto_flags[@]}" \
         --version-script "$tri/tooling/native/app-symbols.map" --exclude-libs=ALL \
         --wrap=stat --wrap=lstat \
         --wrap=sceVideoOutIsOutputSupported --wrap=sceVideoOutConfigureOutput --wrap=sceVideoOutSetFlipRate \

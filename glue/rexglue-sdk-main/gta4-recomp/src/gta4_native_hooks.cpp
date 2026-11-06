@@ -11,6 +11,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -6417,11 +6418,26 @@ void FinalizeNativeResolveBatchState(uint8_t* base, uint32_t device) {
   StoreU32(base, device + 12700, UINT32_MAX);
 }
 
+// [ps5 port] A texture or surface past the Xbox 360's 1280x720 that isn't
+// made virtual (its full size comes out of the game's own heap): once per
+// caller and size, for the "Lure" rooftop hang (ps5/game/memory_watch.cpp).
+void NoteConcreteLargeResource(const char* kind, uint32_t caller, uint32_t width, uint32_t height) {
+  if (width <= kOriginalRenderTargetWidth && height <= kOriginalRenderTargetHeight) return;
+  static std::mutex mutex;
+  static std::set<uint64_t> seen;
+  {
+    std::lock_guard lock(mutex);
+    if (seen.size() >= 1024 || !seen.insert((uint64_t(caller) << 32) | (width << 16) | height).second) return;
+  }
+  REXLOG_INFO("ps5 memory: a {}x{} {} made at full size from game code {:08X}", width, height, kind, caller);
+}
+
 extern "C" void sub_82A44850(PPCContext& ctx, uint8_t* base) {
   const uint32_t requested_width = ctx.r3.u32;
   const uint32_t requested_height = ctx.r4.u32;
   const uint32_t return_address = ctx.lr;
   if (!ShouldUseNativeDisplayBacking(ctx, requested_width, requested_height)) {
+    if (IsNativeMode()) NoteConcreteLargeResource("texture", return_address, requested_width, requested_height);
     __imp__sub_82A44850(ctx, base);
     return;
   }
@@ -6438,6 +6454,7 @@ extern "C" void sub_82A44970(PPCContext& ctx, uint8_t* base) {
   const uint32_t requested_height = ctx.r4.u32;
   const uint32_t return_address = ctx.lr;
   if (!ShouldUseNativeDisplayBacking(ctx, requested_width, requested_height)) {
+    if (IsNativeMode()) NoteConcreteLargeResource("surface", return_address, requested_width, requested_height);
     __imp__sub_82A44970(ctx, base);
     return;
   }
@@ -7871,9 +7888,8 @@ REXCVAR_DECLARE(bool, ps5_decoupled_presentation);
 REXCVAR_DECLARE(uint32_t, gta4_frame_limit);
 REXCVAR_DECLARE(std::string, gta4_native_frame_generation);
 REXCVAR_DECLARE(std::string, ps5_frame_generation);
-REXCVAR_DEFINE_BOOL(ps5_cutscene_30, true, "PS5",
-                    "Hold the game at 30 FPS during cutscenes and loading screens (the Xbox 360's rate): some "
-                    "missions' scripts, like Lure's rooftop, stall when they run faster");
+REXCVAR_DEFINE_BOOL(ps5_cutscene_30, false, "PS5",
+                    "Hold the game at 30 FPS during cutscenes and loading screens (the Xbox 360's rate)");
 extern std::atomic<int64_t> g_ps5_loading_screen_ns;
 
 // [ps5 port] Frame generation's cadence at 120 Hz: 60 -> 120 (each image one
@@ -7975,9 +7991,10 @@ static void Ps5LimitFrameRate(uint8_t* base) {
     const uint32_t refresh = gta4ps5::display::HighRefresh() ? 120 : 60;
     fps = refresh / (2 * std::max<uint32_t>(1, rex::frame_stats::g_fg_vblanks_per_image.load(std::memory_order_relaxed)));
   }
-  // [ps5 port] Cutscenes and loading screens at 30, as on the Xbox 360: in
-  // Lure, the cutscene on the rooftop ran on into an endless loading screen
-  // at 60 and 120 FPS (eight 1.0.1-1.0.2 reports), and went through at 30.
+  // [ps5 port] Cutscenes and loading screens at 30, as on the Xbox 360 (off
+  // since 1.2). It was a guess at Lure's endless rooftop loading screen, which
+  // hung at 30 as well: that was the game's allocator waiting for room the
+  // streamer never made (ps5/game/memory_watch.cpp).
   if (REXCVAR_GET(ps5_cutscene_30) && !rex::frame_stats::g_frame_generation_active.load(std::memory_order_relaxed)) {
     constexpr uint32_t kCutsceneGlobal = 0x82B977F0;  // (gta4_sony_feedback.cpp's)
     const int64_t loading_ns = g_ps5_loading_screen_ns.load(std::memory_order_relaxed);

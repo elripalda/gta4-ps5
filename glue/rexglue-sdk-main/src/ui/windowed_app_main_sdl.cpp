@@ -416,15 +416,18 @@ static void Ps5DiagMonitor() {
         const bool lean = g_lean_capture.load();
         const bool prefetch = g_capture_prefetch.load();
         const bool main_core = IsOwnCoresLayout(kept) && g_main_core.load();
-        REXLOG_INFO("ps5 cpus: game {:#x}, worker {:#x}, recorder {:#x} ({}{}{}; {} capture{}{})",
+        const bool on_core = g_capture_on_core.load();
+        const uint64_t ring_wait_us = g_capture_ring_wait_us.exchange(0);
+        REXLOG_INFO("ps5 cpus: game {:#x}, worker {:#x}, recorder {:#x}, capture {:#x} ({}{}{}; {} capture{}{}{}; "
+                    "the game waited {:.1f} ms on the capture thread)",
                     g_cpus_title.exchange(0), g_cpus_worker.exchange(0), g_cpus_recorder.exchange(0),
-                    layout, main_core ? ", main thread on its own core" : "",
+                    g_cpus_capture.exchange(0), layout, main_core ? ", main thread on its own core" : "",
                     g_renderer_cpu_compare.load() ? ", comparing" : "",
-                    lean ? "lean" : "classic", lean && !prefetch ? " without prefetch" : "",
-                    g_lean_capture_compare.load() ? ", comparing" : "");
-        // Game Thread Capture on Compare: lean's prefetching the other way for
-        // the next 10 s.
-        if (g_lean_capture_compare.load()) g_capture_prefetch.store(!prefetch);
+                    lean ? "lean" : "classic", on_core ? " on its own core" : "",
+                    lean && !prefetch ? " without prefetch" : "",
+                    g_capture_core_compare.load() ? ", comparing" : "", double(ring_wait_us) / 1000.0);
+        // Game Thread Capture on Compare: own core and lean in turn, 10 s each.
+        if (g_capture_core_compare.load()) g_capture_on_core.store(!on_core);
         // Renderer Threads on Compare: the other layout for the next 10 s.
         uint64_t next = kept;
         if (g_renderer_cpu_compare.load()) {
