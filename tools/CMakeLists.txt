@@ -13,6 +13,7 @@ add_subdirectory(${LIBERTY_RECOMP_TOOLS_ROOT}/file_to_c)
 add_subdirectory(${LIBERTY_RECOMP_TOOLS_ROOT}/fshasher)
 add_subdirectory(${LIBERTY_RECOMP_TOOLS_ROOT}/u8extract)
 add_subdirectory(${LIBERTY_RECOMP_TOOLS_ROOT}/x_decompress)
+add_subdirectory(${LIBERTY_RECOMP_TOOLS_ROOT}/frontend_controller_patch)
 # XenonRecomp removed — replaced by rexglue SDK (graine) static recompilation.
 set(XENOS_RECOMP_GTA4 ON)
 add_subdirectory(${LIBERTY_RECOMP_TOOLS_ROOT}/XenosRecomp)
