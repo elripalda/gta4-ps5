@@ -1,5 +1,7 @@
 #include "rpf_button_prompts.h"
 
+#include "frontend_controller_patch.h"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -42,6 +44,7 @@ constexpr uint32_t kDirectoryBit = 0x80000000;
 constexpr uint32_t kResourceMask = 0xC0000000;
 constexpr uint32_t kResourceOffsetMask = 0x7FFFFF00;
 constexpr std::string_view kPromptPath = "/textures/buttons_360.xtd";
+constexpr std::string_view kFrontendPath = "/textures/frontend_360.xtd";
 constexpr std::string_view kPromptMount = "\\Device\\LibertyRecomp\\ButtonPrompts";
 
 struct RpfHeader {
@@ -70,6 +73,7 @@ struct ParsedArchive {
   std::vector<TocEntry> entries;
   size_t string_table_offset = 0;
   size_t prompt_entry_index = 0;
+  std::optional<size_t> frontend_entry_index;
   uint64_t file_size = 0;
   uint64_t max_data_end = 0;
 };
@@ -157,8 +161,8 @@ std::optional<std::string_view> EntryName(const ParsedArchive& archive, uint32_t
   return std::string_view(begin, static_cast<size_t>(end - begin));
 }
 
-bool FindPromptEntry(const ParsedArchive& archive, size_t index, std::string_view parent,
-                     std::vector<bool>& active, size_t& result) {
+bool FindEntry(const ParsedArchive& archive, size_t index, std::string_view parent,
+               std::string_view target, std::vector<bool>& active, size_t& result) {
   if (index >= archive.entries.size() || active[index]) {
     return false;
   }
@@ -184,13 +188,13 @@ bool FindPromptEntry(const ParsedArchive& archive, size_t index, std::string_vie
     std::string path(parent);
     path.push_back('/');
     path.append(*name);
-    if (!child.is_directory && path == kPromptPath) {
+    if (!child.is_directory && path == target) {
       result = static_cast<size_t>(child_index);
       active[index] = false;
       return true;
     }
     if (child.is_directory &&
-        FindPromptEntry(archive, static_cast<size_t>(child_index), path, active, result)) {
+        FindEntry(archive, static_cast<size_t>(child_index), path, target, active, result)) {
       active[index] = false;
       return true;
     }
@@ -288,7 +292,7 @@ std::optional<ParsedArchive> ParseArchive(const std::filesystem::path& path,
     return std::nullopt;
   }
   std::vector<bool> active(archive.entries.size());
-  if (!FindPromptEntry(archive, 0, "", active, archive.prompt_entry_index)) {
+  if (!FindEntry(archive, 0, "", kPromptPath, active, archive.prompt_entry_index)) {
     error = "RPF does not contain /textures/buttons_360.xtd";
     return std::nullopt;
   }
@@ -296,6 +300,16 @@ std::optional<ParsedArchive> ParseArchive(const std::filesystem::path& path,
   if (!prompt.is_resource || prompt.resource_type != kTextureDictionaryType) {
     error = "buttons_360.xtd is not the expected texture-dictionary resource";
     return std::nullopt;
+  }
+
+  size_t frontend_index = 0;
+  if (FindEntry(archive, 0, "", kFrontendPath, active, frontend_index)) {
+    const auto& frontend = archive.entries[frontend_index];
+    if (!frontend.is_resource || frontend.resource_type != kTextureDictionaryType) {
+      error = "frontend_360.xtd is not the expected texture-dictionary resource";
+      return std::nullopt;
+    }
+    archive.frontend_entry_index = frontend_index;
   }
   return archive;
 }
@@ -327,30 +341,65 @@ bool WriteZeros(std::fstream& stream, uint64_t offset, uint64_t size) {
   return true;
 }
 
+struct ResourceReplacement {
+  size_t entry_index = 0;
+  std::span<const uint8_t> data;
+};
+
 bool BuildShadowArchive(const std::filesystem::path& source,
                         const std::filesystem::path& destination, std::span<const uint8_t> key,
-                        std::span<const uint8_t> replacement, std::string& error) {
+                        std::span<const ResourceReplacement> replacements, std::string& error) {
   auto archive = ParseArchive(source, key, error);
   if (!archive) {
     return false;
   }
-  if (replacement.size() < 12 || ReadU32(replacement, 0) != kResourceMagic ||
-      ReadU32(replacement, 4) != kTextureDictionaryType ||
-      replacement.size() > std::numeric_limits<uint32_t>::max()) {
-    error = "replacement is not a valid GTA IV texture dictionary";
+  if (replacements.empty()) {
+    error = "no replacement resources were requested";
     return false;
   }
 
-  const auto& old_entry = archive->entries[archive->prompt_entry_index];
-  const uint64_t old_allocation = AlignUp(old_entry.size_in_archive, kBlockSize);
-  const uint64_t new_allocation = AlignUp(replacement.size(), kBlockSize);
-  uint64_t new_offset = old_entry.offset;
-  if (new_allocation > old_allocation) {
-    new_offset = AlignUp(std::max(archive->file_size, archive->max_data_end), kBlockSize);
-  }
-  if (new_offset > kResourceOffsetMask) {
-    error = "replacement resource offset exceeds the RPF2 field width";
-    return false;
+  struct Placement {
+    size_t entry_index = 0;
+    uint64_t offset = 0;
+    uint64_t allocation = 0;
+  };
+  std::vector<Placement> placements;
+  placements.reserve(replacements.size());
+  uint64_t append_offset = AlignUp(std::max(archive->file_size, archive->max_data_end), kBlockSize);
+
+  for (const auto& replacement : replacements) {
+    if (replacement.entry_index >= archive->entries.size()) {
+      error = "replacement entry index is out of range";
+      return false;
+    }
+    if (replacement.data.size() < 12 || ReadU32(replacement.data, 0) != kResourceMagic ||
+        ReadU32(replacement.data, 4) != kTextureDictionaryType ||
+        replacement.data.size() > std::numeric_limits<uint32_t>::max()) {
+      error = "replacement is not a valid GTA IV texture dictionary";
+      return false;
+    }
+    const auto& entry = archive->entries[replacement.entry_index];
+    if (!entry.is_resource || entry.resource_type != kTextureDictionaryType || entry.is_directory) {
+      error = "replacement target is not a texture-dictionary resource";
+      return false;
+    }
+
+    const uint64_t old_allocation = AlignUp(entry.size_in_archive, kBlockSize);
+    const uint64_t new_allocation = AlignUp(replacement.data.size(), kBlockSize);
+    Placement placement;
+    placement.entry_index = replacement.entry_index;
+    placement.allocation = new_allocation;
+    if (new_allocation > old_allocation) {
+      placement.offset = append_offset;
+      append_offset += new_allocation;
+    } else {
+      placement.offset = entry.offset;
+    }
+    if (placement.offset > kResourceOffsetMask) {
+      error = "replacement resource offset exceeds the RPF2 field width";
+      return false;
+    }
+    placements.push_back(placement);
   }
 
   std::error_code fs_error;
@@ -362,22 +411,42 @@ bool BuildShadowArchive(const std::filesystem::path& source,
   }
 
   std::fstream stream(destination, std::ios::binary | std::ios::in | std::ios::out);
-  if (!stream || !WriteZeros(stream, old_entry.offset, old_allocation)) {
-    error = "could not clear the old prompt allocation";
+  if (!stream) {
+    error = "could not open the shadow RPF for writing";
     return false;
   }
-  stream.seekp(static_cast<std::streamoff>(new_offset), std::ios::beg);
-  if (!stream.write(reinterpret_cast<const char*>(replacement.data()), replacement.size()) ||
-      !WriteZeros(stream, new_offset + replacement.size(), new_allocation - replacement.size())) {
-    error = "could not write the replacement prompt resource";
-    return false;
+  for (const auto& replacement : replacements) {
+    const auto& entry = archive->entries[replacement.entry_index];
+    if (!WriteZeros(stream, entry.offset, AlignUp(entry.size_in_archive, kBlockSize))) {
+      error = "could not clear an old resource allocation";
+      return false;
+    }
+  }
+  for (const auto& placement : placements) {
+    const auto match = std::find_if(
+        replacements.begin(), replacements.end(), [&](const ResourceReplacement& candidate) {
+          return candidate.entry_index == placement.entry_index;
+        });
+    if (match == replacements.end()) {
+      error = "internal replacement bookkeeping failed";
+      return false;
+    }
+    stream.seekp(static_cast<std::streamoff>(placement.offset), std::ios::beg);
+    if (!stream.write(reinterpret_cast<const char*>(match->data.data()), match->data.size()) ||
+        !WriteZeros(stream, placement.offset + match->data.size(),
+                    placement.allocation - match->data.size())) {
+      error = "could not write a replacement resource";
+      return false;
+    }
+
+    const auto& entry = archive->entries[placement.entry_index];
+    WriteU32(archive->toc, entry.toc_offset + 4, static_cast<uint32_t>(match->data.size()));
+    WriteU32(archive->toc, entry.toc_offset + 8,
+             static_cast<uint32_t>(placement.offset) | kTextureDictionaryType);
+    WriteU32(archive->toc, entry.toc_offset + 12, ReadU32(match->data, 8));
   }
 
   auto toc = archive->toc;
-  const size_t entry_offset = old_entry.toc_offset;
-  WriteU32(toc, entry_offset + 4, static_cast<uint32_t>(replacement.size()));
-  WriteU32(toc, entry_offset + 8, static_cast<uint32_t>(new_offset) | kTextureDictionaryType);
-  WriteU32(toc, entry_offset + 12, ReadU32(replacement, 8));
   if (archive->header.encrypted && !CryptToc(toc, key, false)) {
     error = "could not encrypt the updated RPF TOC";
     return false;
@@ -476,6 +545,22 @@ std::optional<std::filesystem::path> FindAsset(std::string_view variant) {
   return std::nullopt;
 }
 
+std::optional<std::filesystem::path> FindControllerDds(std::string_view variant) {
+  const auto executable_assets = rex::filesystem::GetResourcesFolder() / "button_prompts" /
+                                 variant / "dds_textures" / "controller_512.dds";
+  std::error_code error;
+  if (std::filesystem::is_regular_file(executable_assets, error)) {
+    return executable_assets;
+  }
+  const auto source_assets = std::filesystem::path(GTA4_BUTTON_PROMPT_ASSET_ROOT) / variant /
+                             "dds_textures" / "controller_512.dds";
+  error.clear();
+  if (std::filesystem::is_regular_file(source_assets, error)) {
+    return source_assets;
+  }
+  return std::nullopt;
+}
+
 std::optional<std::vector<uint8_t>> LoadKey(const std::filesystem::path& game_data_root) {
   const std::array candidates = {
       game_data_root.parent_path() / "aes_key.bin", game_data_root / "aes_key.bin",
@@ -490,26 +575,43 @@ std::optional<std::vector<uint8_t>> LoadKey(const std::filesystem::path& game_da
 }
 
 bool VerifyShadow(const std::filesystem::path& path, std::span<const uint8_t> key,
-                  std::string_view expected_hash, std::string& error) {
+                  std::string_view expected_prompt_hash,
+                  std::optional<std::string_view> expected_frontend_hash, std::string& error) {
   auto archive = ParseArchive(path, key, error);
   if (!archive) {
     return false;
   }
-  auto data = ReadEntryData(path, archive->entries[archive->prompt_entry_index]);
-  if (!data) {
+  auto prompt = ReadEntryData(path, archive->entries[archive->prompt_entry_index]);
+  if (!prompt) {
     error = "could not read the prompt resource from the shadow RPF";
     return false;
   }
-  if (HashBytes(*data) != expected_hash) {
+  if (HashBytes(*prompt) != expected_prompt_hash) {
     error = "shadow RPF prompt resource hash does not match the selected asset";
     return false;
+  }
+  if (expected_frontend_hash) {
+    if (!archive->frontend_entry_index) {
+      error = "shadow RPF is missing the frontend resource";
+      return false;
+    }
+    auto frontend = ReadEntryData(path, archive->entries[*archive->frontend_entry_index]);
+    if (!frontend) {
+      error = "could not read the frontend resource from the shadow RPF";
+      return false;
+    }
+    if (HashBytes(*frontend) != *expected_frontend_hash) {
+      error = "shadow RPF frontend resource hash does not match the patched asset";
+      return false;
+    }
   }
   return true;
 }
 
 std::optional<std::filesystem::path> PrepareArchive(const std::filesystem::path& game_data_root,
                                                     const std::filesystem::path& cache_root,
-                                                    std::string_view variant) {
+                                                    std::string_view variant,
+                                                    std::span<const uint8_t> controller_dds) {
   const auto source = game_data_root / "xbox360.rpf";
   auto asset_path = FindAsset(variant);
   auto key = LoadKey(game_data_root);
@@ -523,12 +625,46 @@ std::optional<std::filesystem::path> PrepareArchive(const std::filesystem::path&
   }
 
   auto replacement = ReadFile(*asset_path);
+  if (!replacement) {
+    REXLOG_WARN("Button prompts: could not read '{}'", asset_path->string());
+    return std::nullopt;
+  }
+
+  std::string parse_error;
+  auto archive = ParseArchive(source, *key, parse_error);
+  if (!archive) {
+    REXLOG_WARN("Button prompts: could not parse '{}': {}", source.string(), parse_error);
+    return std::nullopt;
+  }
+
+  std::optional<std::vector<uint8_t>> frontend_replacement;
+  if (controller_dds.empty()) {
+    REXLOG_WARN("Button prompts: controller DDS for '{}' is unavailable; keeping the Xbox diagram",
+                variant);
+  } else if (!archive->frontend_entry_index) {
+    REXLOG_WARN("Button prompts: frontend_360.xtd is missing; keeping the Xbox diagram");
+  } else {
+    auto retail = ReadEntryData(source, archive->entries[*archive->frontend_entry_index]);
+    std::string patch_error;
+    if (!retail) {
+      REXLOG_WARN("Button prompts: could not read frontend_360.xtd from the retail archive");
+    } else {
+      std::vector<uint8_t> patched;
+      if (PatchFrontendController(*retail, controller_dds, patched, patch_error)) {
+        frontend_replacement = std::move(patched);
+      } else {
+        REXLOG_WARN("Button prompts: could not patch frontend_360.xtd: {}", patch_error);
+      }
+    }
+  }
+
   const std::string source_hash = rex::crypto::sha256_file(source);
-  const std::string replacement_hash = replacement ? HashBytes(*replacement) : "";
-  if (!replacement || source_hash.empty() || replacement_hash.empty()) {
+  const std::string replacement_hash = HashBytes(*replacement);
+  if (source_hash.empty() || replacement_hash.empty()) {
     REXLOG_WARN("Button prompts: could not read or hash the archive inputs");
     return std::nullopt;
   }
+  const std::string frontend_hash = frontend_replacement ? HashBytes(*frontend_replacement) : "";
 
   const auto prompt_cache = cache_root / "button_prompts";
   std::error_code fs_error;
@@ -539,21 +675,31 @@ std::optional<std::filesystem::path> PrepareArchive(const std::filesystem::path&
     return std::nullopt;
   }
   const std::string cache_name =
-      "xbox360-" + source_hash.substr(0, 16) + "-" + replacement_hash.substr(0, 16) + ".rpf";
+      "xbox360-" + source_hash.substr(0, 16) + "-" + replacement_hash.substr(0, 16) + "-" +
+      (frontend_replacement ? frontend_hash.substr(0, 16) : std::string("nofe")) + ".rpf";
   const auto destination = prompt_cache / cache_name;
+  const std::optional<std::string_view> expected_frontend =
+      frontend_replacement ? std::optional<std::string_view>(frontend_hash) : std::nullopt;
 
   std::string error;
   if (std::filesystem::is_regular_file(destination, fs_error) &&
-      VerifyShadow(destination, *key, replacement_hash, error)) {
+      VerifyShadow(destination, *key, replacement_hash, expected_frontend, error)) {
     REXLOG_INFO("Button prompts: using cached '{}' archive", variant);
     return destination;
+  }
+
+  std::vector<ResourceReplacement> replacements;
+  replacements.push_back({archive->prompt_entry_index, std::span<const uint8_t>(*replacement)});
+  if (frontend_replacement) {
+    replacements.push_back(
+        {*archive->frontend_entry_index, std::span<const uint8_t>(*frontend_replacement)});
   }
 
   const auto temporary = destination.string() + ".tmp";
   fs_error.clear();
   std::filesystem::remove(temporary, fs_error);
-  if (!BuildShadowArchive(source, temporary, *key, *replacement, error) ||
-      !VerifyShadow(temporary, *key, replacement_hash, error)) {
+  if (!BuildShadowArchive(source, temporary, *key, replacements, error) ||
+      !VerifyShadow(temporary, *key, replacement_hash, expected_frontend, error)) {
     std::filesystem::remove(temporary, fs_error);
     REXLOG_WARN("Button prompts: could not build shadow archive: {}", error);
     return std::nullopt;
@@ -596,8 +742,23 @@ bool MountArchive(rex::Runtime& runtime, const std::filesystem::path& archive) {
 bool PrepareAndMount(rex::Runtime& runtime, const std::filesystem::path& game_data_root,
                      const std::filesystem::path& cache_root) {
   const std::string variant = SelectVariant();
-  auto archive = PrepareArchive(game_data_root, cache_root, variant);
-  return archive && MountArchive(runtime, *archive);
+
+  std::vector<uint8_t> controller_dds;
+  if (auto dds_path = FindControllerDds(variant)) {
+    std::string dds_error;
+    if (!LoadControllerDds(*dds_path, controller_dds, dds_error)) {
+      REXLOG_WARN("Button prompts: could not load '{}': {}", dds_path->string(), dds_error);
+      controller_dds.clear();
+    }
+  } else {
+    REXLOG_WARN("Button prompts: controller DDS for '{}' was not found", variant);
+  }
+
+  auto archive = PrepareArchive(game_data_root, cache_root, variant, controller_dds);
+  if (!archive || !MountArchive(runtime, *archive)) {
+    return false;
+  }
+  return true;
 }
 
 }  // namespace gta4::button_prompts
