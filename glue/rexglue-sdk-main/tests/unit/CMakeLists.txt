@@ -107,6 +107,7 @@ add_executable(unit_tests
     ppc/stack_test.cpp
     system/guest_path_test.cpp
     system/gta4_frontend_menu_policy_test.cpp
+    system/gta4_ps5_button_label_policy_test.cpp
     system/gta4_aspect_policy_test.cpp
     system/gta4_quicksave_policy_test.cpp
     system/gta4_draw_distance_policy_test.cpp
