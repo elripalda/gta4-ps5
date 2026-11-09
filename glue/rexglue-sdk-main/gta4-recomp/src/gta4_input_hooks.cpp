@@ -26,8 +26,10 @@
 #include <rex/runtime.h>
 #include <rex/ui/virtual_key.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -457,6 +459,45 @@ struct ParachuteScriptContext {
   uint32_t state = 0;
   bool active = false;
 };
+
+// [ps5 port] The finale's helicopter climb ("Repeatedly tap A to climb into
+// the chopper", both endings) counts taps per game frame as tuned for 30 FPS:
+// at 60 it can't be passed (as on PC and the Xbox Series X). Each button or
+// control query the finale's scripts make is noted here; the frame limit holds
+// 30 while they keep asking (gta4_native_hooks.cpp).
+constexpr uint32_t kFinaleProgramKeys[] = {
+    0xDF7C5C9C, 0x8F959493, 0xFB236BB5, 0xECE5CF3A, 0x96C722FE,  // finale1, finale1a, finale1b, finale1c, finale1d
+    0xEA2671F0, 0xEE6FD0E6, 0x9DC72F96, 0x8B818B0B, 0x94BE471D,  // finale2, finale2a, finale2b, finale2c, finale3
+};
+std::atomic<int64_t> g_finale_button_query_ns{0};
+
+void NoteFinaleButtonQuery(uint8_t* base) {
+  const uint32_t thread = LoadU32(base, kExecutingScriptThreadAddress);
+  if (!thread) return;
+  const uint32_t key = LoadU32(base, thread + kScriptProgramKeyOffset);
+  // Which scripts ask for buttons, once each (names are hashed: a log shows
+  // whether the climb's script is one of the above).
+  {
+    static std::mutex seen_mutex;
+    static std::array<uint32_t, 64> seen{};
+    static size_t seen_count = 0;
+    std::lock_guard lock(seen_mutex);
+    if (seen_count < seen.size() &&
+        std::find(seen.begin(), seen.begin() + seen_count, key) == seen.begin() + seen_count) {
+      seen[seen_count++] = key;
+      REXLOG_INFO("gta4-input: script {:08X} asks for buttons", key);
+    }
+  }
+  for (const uint32_t finale : kFinaleProgramKeys) {
+    if (key == finale) {
+      g_finale_button_query_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count(),
+                                     std::memory_order_relaxed);
+      return;
+    }
+  }
+}
 
 ParachuteScriptContext ReadParachuteScriptContext(uint8_t* base) {
   const uint32_t thread = LoadU32(base, kExecutingScriptThreadAddress);
@@ -2093,6 +2134,8 @@ void MaybeForceDirectWeaponAction(PPCContext& ctx, uint8_t* base,
   }
 }
 
+// Steady-clock time of the finale scripts' last button query (0: none yet).
+int64_t FinaleButtonQueryNs() { return g_finale_button_query_ns.load(std::memory_order_relaxed); }
 }  // namespace gta4::input
 
 extern "C" void sub_828CCD60(PPCContext& ctx, uint8_t* base) {
@@ -2563,6 +2606,7 @@ extern "C" void sub_822D4158(PPCContext& ctx, uint8_t* base) {
 
 extern "C" void sub_825D1AF8(PPCContext& ctx, uint8_t* base) {
   const uint32_t call_context = ctx.r3.u32;
+  gta4::input::NoteFinaleButtonQuery(base);
   const uint32_t touch_thread = gta4::input::ReadTouchScriptThread(base);
   const auto touch_context = gta4::input::GetTouchContextSnapshot();
   __imp__sub_825D1AF8(ctx, base);
@@ -2584,6 +2628,7 @@ extern "C" void sub_825D1AF8(PPCContext& ctx, uint8_t* base) {
 
 extern "C" void sub_825D1B40(PPCContext& ctx, uint8_t* base) {
   const uint32_t call_context = ctx.r3.u32;
+  gta4::input::NoteFinaleButtonQuery(base);
   const uint32_t touch_thread = gta4::input::ReadTouchScriptThread(base);
   const auto touch_context = gta4::input::GetTouchContextSnapshot();
   const auto parachute = gta4::input::ReadTouchParachuteState(base);
@@ -2597,6 +2642,7 @@ extern "C" void sub_825D1B40(PPCContext& ctx, uint8_t* base) {
 
 extern "C" void sub_825D1B88(PPCContext& ctx, uint8_t* base) {
   const uint32_t call_context = ctx.r3.u32;
+  gta4::input::NoteFinaleButtonQuery(base);
   const uint32_t touch_thread = gta4::input::ReadTouchScriptThread(base);
   const auto touch_context = gta4::input::GetTouchContextSnapshot();
   __imp__sub_825D1B88(ctx, base);
@@ -2618,6 +2664,7 @@ extern "C" void sub_825D1B88(PPCContext& ctx, uint8_t* base) {
 
 extern "C" void sub_825D1BD0(PPCContext& ctx, uint8_t* base) {
   const uint32_t call_context = ctx.r3.u32;
+  gta4::input::NoteFinaleButtonQuery(base);
   const uint32_t touch_thread = gta4::input::ReadTouchScriptThread(base);
   const auto touch_context = gta4::input::GetTouchContextSnapshot();
   __imp__sub_825D1BD0(ctx, base);

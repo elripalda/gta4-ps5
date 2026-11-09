@@ -7888,6 +7888,9 @@ REXCVAR_DECLARE(bool, ps5_decoupled_presentation);
 REXCVAR_DECLARE(uint32_t, gta4_frame_limit);
 REXCVAR_DECLARE(std::string, gta4_native_frame_generation);
 REXCVAR_DECLARE(std::string, ps5_frame_generation);
+namespace gta4::input {
+int64_t FinaleButtonQueryNs();
+}
 REXCVAR_DEFINE_BOOL(ps5_cutscene_30, false, "PS5",
                     "Hold the game at 30 FPS during cutscenes and loading screens (the Xbox 360's rate)");
 extern std::atomic<int64_t> g_ps5_loading_screen_ns;
@@ -8008,6 +8011,22 @@ static void Ps5LimitFrameRate(uint8_t* base) {
       REXLOG_INFO("ps5 frame limit: {}", story ? "30 FPS for a cutscene or loading screen" : "back to the limit");
     }
     if (story && (fps == 0 || fps > 30)) fps = 30;
+  }
+  // [ps5 port] The finale's helicopter climb counts taps per frame as tuned for
+  // 30 FPS (gta4_input_hooks.cpp): 30 while its scripts ask for buttons, and a
+  // moment after.
+  if (!rex::frame_stats::g_frame_generation_active.load(std::memory_order_relaxed)) {
+    const int64_t asked_ns = gta4::input::FinaleButtonQueryNs();
+    const int64_t steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch())
+                                  .count();
+    const bool finale = asked_ns && steady_ns - asked_ns < 1500000000;
+    static bool was_finale = false;
+    if (finale != was_finale) {
+      was_finale = finale;
+      REXLOG_INFO("ps5 frame limit: {}", finale ? "30 FPS while the finale asks for button taps" : "back to the limit");
+    }
+    if (finale && (fps == 0 || fps > 30)) fps = 30;
   }
   // [ps5 port] Smooth Heavy Areas (ps5_smooth_40): at 120 Hz with a 60 limit,
   // where a quarter of a second's frames run past 16.9 ms, an even 40 (three

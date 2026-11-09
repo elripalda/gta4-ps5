@@ -1398,10 +1398,67 @@ index 64de44f5..393299f5 100644
  void GTA4_HelpTraceTextSubmit(PPCContext& ctx, uint8_t* base,
                               void (*original)(PPCContext&, uint8_t*)) {
 diff --git a/glue/rexglue-sdk-main/gta4-recomp/src/gta4_input_hooks.cpp b/glue/rexglue-sdk-main/gta4-recomp/src/gta4_input_hooks.cpp
-index f8dc1eec..82daa9ec 100644
+index f8dc1eec..6076b114 100644
 --- a/glue/rexglue-sdk-main/gta4-recomp/src/gta4_input_hooks.cpp
 +++ b/glue/rexglue-sdk-main/gta4-recomp/src/gta4_input_hooks.cpp
-@@ -940,7 +940,8 @@ void ProcessPauseTabShoulders(PPCContext& parent, uint8_t* base,
+@@ -26,8 +26,10 @@
+ #include <rex/runtime.h>
+ #include <rex/ui/virtual_key.h>
+ 
++#include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
+ #include <bit>
+ #include <cstddef>
+ #include <cstdint>
+@@ -458,6 +460,45 @@ struct ParachuteScriptContext {
+   bool active = false;
+ };
+ 
++// [ps5 port] The finale's helicopter climb ("Repeatedly tap A to climb into
++// the chopper", both endings) counts taps per game frame as tuned for 30 FPS:
++// at 60 it can't be passed (as on PC and the Xbox Series X). Each button or
++// control query the finale's scripts make is noted here; the frame limit holds
++// 30 while they keep asking (gta4_native_hooks.cpp).
++constexpr uint32_t kFinaleProgramKeys[] = {
++    0xDF7C5C9C, 0x8F959493, 0xFB236BB5, 0xECE5CF3A, 0x96C722FE,  // finale1, finale1a, finale1b, finale1c, finale1d
++    0xEA2671F0, 0xEE6FD0E6, 0x9DC72F96, 0x8B818B0B, 0x94BE471D,  // finale2, finale2a, finale2b, finale2c, finale3
++};
++std::atomic<int64_t> g_finale_button_query_ns{0};
++
++void NoteFinaleButtonQuery(uint8_t* base) {
++  const uint32_t thread = LoadU32(base, kExecutingScriptThreadAddress);
++  if (!thread) return;
++  const uint32_t key = LoadU32(base, thread + kScriptProgramKeyOffset);
++  // Which scripts ask for buttons, once each (names are hashed: a log shows
++  // whether the climb's script is one of the above).
++  {
++    static std::mutex seen_mutex;
++    static std::array<uint32_t, 64> seen{};
++    static size_t seen_count = 0;
++    std::lock_guard lock(seen_mutex);
++    if (seen_count < seen.size() &&
++        std::find(seen.begin(), seen.begin() + seen_count, key) == seen.begin() + seen_count) {
++      seen[seen_count++] = key;
++      REXLOG_INFO("gta4-input: script {:08X} asks for buttons", key);
++    }
++  }
++  for (const uint32_t finale : kFinaleProgramKeys) {
++    if (key == finale) {
++      g_finale_button_query_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                         std::chrono::steady_clock::now().time_since_epoch())
++                                         .count(),
++                                     std::memory_order_relaxed);
++      return;
++    }
++  }
++}
++
+ ParachuteScriptContext ReadParachuteScriptContext(uint8_t* base) {
+   const uint32_t thread = LoadU32(base, kExecutingScriptThreadAddress);
+   if (!thread ||
+@@ -940,7 +981,8 @@ void ProcessPauseTabShoulders(PPCContext& parent, uint8_t* base,
    const bool left_down = keyboard_left_down || gamepad_left_down;
    const bool right_down = gamepad_right_down;
  
@@ -1411,6 +1468,47 @@ index f8dc1eec..82daa9ec 100644
        !gta4::frontend_menu::policy::IsPauseTabScreen(screen)) {
      g_pause_tab_input = {
          .epoch = epoch.sequence,
+@@ -2092,6 +2134,8 @@ void MaybeForceDirectWeaponAction(PPCContext& ctx, uint8_t* base,
+   }
+ }
+ 
++// Steady-clock time of the finale scripts' last button query (0: none yet).
++int64_t FinaleButtonQueryNs() { return g_finale_button_query_ns.load(std::memory_order_relaxed); }
+ }  // namespace gta4::input
+ 
+ extern "C" void sub_828CCD60(PPCContext& ctx, uint8_t* base) {
+@@ -2562,6 +2606,7 @@ extern "C" void sub_822D4158(PPCContext& ctx, uint8_t* base) {
+ 
+ extern "C" void sub_825D1AF8(PPCContext& ctx, uint8_t* base) {
+   const uint32_t call_context = ctx.r3.u32;
++  gta4::input::NoteFinaleButtonQuery(base);
+   const uint32_t touch_thread = gta4::input::ReadTouchScriptThread(base);
+   const auto touch_context = gta4::input::GetTouchContextSnapshot();
+   __imp__sub_825D1AF8(ctx, base);
+@@ -2583,6 +2628,7 @@ extern "C" void sub_825D1AF8(PPCContext& ctx, uint8_t* base) {
+ 
+ extern "C" void sub_825D1B40(PPCContext& ctx, uint8_t* base) {
+   const uint32_t call_context = ctx.r3.u32;
++  gta4::input::NoteFinaleButtonQuery(base);
+   const uint32_t touch_thread = gta4::input::ReadTouchScriptThread(base);
+   const auto touch_context = gta4::input::GetTouchContextSnapshot();
+   const auto parachute = gta4::input::ReadTouchParachuteState(base);
+@@ -2596,6 +2642,7 @@ extern "C" void sub_825D1B40(PPCContext& ctx, uint8_t* base) {
+ 
+ extern "C" void sub_825D1B88(PPCContext& ctx, uint8_t* base) {
+   const uint32_t call_context = ctx.r3.u32;
++  gta4::input::NoteFinaleButtonQuery(base);
+   const uint32_t touch_thread = gta4::input::ReadTouchScriptThread(base);
+   const auto touch_context = gta4::input::GetTouchContextSnapshot();
+   __imp__sub_825D1B88(ctx, base);
+@@ -2617,6 +2664,7 @@ extern "C" void sub_825D1B88(PPCContext& ctx, uint8_t* base) {
+ 
+ extern "C" void sub_825D1BD0(PPCContext& ctx, uint8_t* base) {
+   const uint32_t call_context = ctx.r3.u32;
++  gta4::input::NoteFinaleButtonQuery(base);
+   const uint32_t touch_thread = gta4::input::ReadTouchScriptThread(base);
+   const auto touch_context = gta4::input::GetTouchContextSnapshot();
+   __imp__sub_825D1BD0(ctx, base);
 diff --git a/glue/rexglue-sdk-main/gta4-recomp/src/gta4_loading_parallax_fix.cpp b/glue/rexglue-sdk-main/gta4-recomp/src/gta4_loading_parallax_fix.cpp
 index c1faf846..14121e44 100644
 --- a/glue/rexglue-sdk-main/gta4-recomp/src/gta4_loading_parallax_fix.cpp
@@ -1498,7 +1596,7 @@ index bb44175b..1b222e35 100644
  struct PlayerInfoBatchProjectionContext {
    bool active = false;
 diff --git a/glue/rexglue-sdk-main/gta4-recomp/src/gta4_native_hooks.cpp b/glue/rexglue-sdk-main/gta4-recomp/src/gta4_native_hooks.cpp
-index 2a4966bd..ba6a8904 100644
+index 2a4966bd..53bf9b9f 100644
 --- a/glue/rexglue-sdk-main/gta4-recomp/src/gta4_native_hooks.cpp
 +++ b/glue/rexglue-sdk-main/gta4-recomp/src/gta4_native_hooks.cpp
 @@ -11,6 +11,7 @@
@@ -2316,7 +2414,7 @@ index 2a4966bd..ba6a8904 100644
    StoreU8(base, device + 10941, LoadU8(base, device + 10941) | uint8_t(4));
    StoreU64(base, device + 16, LoadU64(base, device + 16) | uint64_t(0x00020000));
  }
-@@ -7555,6 +7883,208 @@ extern "C" void sub_826273A0(PPCContext& ctx, uint8_t* base) {
+@@ -7555,6 +7883,227 @@ extern "C" void sub_826273A0(PPCContext& ctx, uint8_t* base) {
    }
  }
  
@@ -2325,6 +2423,9 @@ index 2a4966bd..ba6a8904 100644
 +REXCVAR_DECLARE(uint32_t, gta4_frame_limit);
 +REXCVAR_DECLARE(std::string, gta4_native_frame_generation);
 +REXCVAR_DECLARE(std::string, ps5_frame_generation);
++namespace gta4::input {
++int64_t FinaleButtonQueryNs();
++}
 +REXCVAR_DEFINE_BOOL(ps5_cutscene_30, false, "PS5",
 +                    "Hold the game at 30 FPS during cutscenes and loading screens (the Xbox 360's rate)");
 +extern std::atomic<int64_t> g_ps5_loading_screen_ns;
@@ -2446,6 +2547,22 @@ index 2a4966bd..ba6a8904 100644
 +    }
 +    if (story && (fps == 0 || fps > 30)) fps = 30;
 +  }
++  // [ps5 port] The finale's helicopter climb counts taps per frame as tuned for
++  // 30 FPS (gta4_input_hooks.cpp): 30 while its scripts ask for buttons, and a
++  // moment after.
++  if (!rex::frame_stats::g_frame_generation_active.load(std::memory_order_relaxed)) {
++    const int64_t asked_ns = gta4::input::FinaleButtonQueryNs();
++    const int64_t steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                  std::chrono::steady_clock::now().time_since_epoch())
++                                  .count();
++    const bool finale = asked_ns && steady_ns - asked_ns < 1500000000;
++    static bool was_finale = false;
++    if (finale != was_finale) {
++      was_finale = finale;
++      REXLOG_INFO("ps5 frame limit: {}", finale ? "30 FPS while the finale asks for button taps" : "back to the limit");
++    }
++    if (finale && (fps == 0 || fps > 30)) fps = 30;
++  }
 +  // [ps5 port] Smooth Heavy Areas (ps5_smooth_40): at 120 Hz with a 60 limit,
 +  // where a quarter of a second's frames run past 16.9 ms, an even 40 (three
 +  // vblanks each) instead of 40-60 landing unevenly on the TV's 8.3 ms steps;
@@ -2525,7 +2642,7 @@ index 2a4966bd..ba6a8904 100644
  extern "C" void sub_82A467D8(PPCContext& ctx, uint8_t* base) {
    if (!IsNativeMode()) {
      __imp__sub_82A467D8(ctx, base);
-@@ -7648,9 +8178,13 @@ extern "C" void sub_82A467D8(PPCContext& ctx, uint8_t* base) {
+@@ -7648,9 +8197,13 @@ extern "C" void sub_82A467D8(PPCContext& ctx, uint8_t* base) {
    }
    g_last_present_frontbuffer.store(command.frontbuffer_texture, std::memory_order_relaxed);
    SubmitNativeCommand(command);
