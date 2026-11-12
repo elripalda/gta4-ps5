@@ -1,9 +1,8 @@
-// GTA IV PS5 - the frame rate counter and the frame time capture (see
-// ps5_overlay.h).
+// GTA IV PS5 - the frame rate counter, the frame time capture (see
+// ps5_overlay.h) and the hand-off of an accepted Return to Hub request.
 #include "ps5_overlay.h"
 
 #include <algorithm>
-#include <cmath>
 #include <ctime>
 #include <filesystem>
 #include <string>
@@ -16,6 +15,7 @@
 #include <rex/logging.h>
 
 #include "../hub/ps5_hub.h"
+#include "../lifecycle/f02_menu_request.h"
 #include "ps5_display.h"
 
 REXCVAR_DEFINE_STRING(ps5_fps_counter, "false", "PS5",
@@ -31,9 +31,16 @@ REXCVAR_DEFINE_BOOL(ps5_overlay_every_vblank, false, "PS5",
 
 namespace gta4ps5 {
 
+namespace f02 = gta4::ps5::lifecycle::f02;
+
 const char* BuildVersion() { return GTA4PS5_VERSION; }
 
-GameOverlay::GameOverlay(rex::ui::ImGuiDrawer* drawer) : ImGuiDialog(drawer) {
+GameOverlay::GameOverlay(rex::ui::ImGuiDrawer* drawer,
+                         std::function<void()> return_to_hub,
+                         std::function<void(bool)> set_title_input_captured)
+    : ImGuiDialog(drawer),
+      return_to_hub_(std::move(return_to_hub)),
+      set_title_input_(std::move(set_title_input_captured)) {
   window_start_ns_ = rex::frame_stats::NowNs();
   window_frames_ = rex::frame_stats::g_presents.load(std::memory_order_acquire);
   if (REXCVAR_GET(ps5_frametime_capture)) {
@@ -56,6 +63,66 @@ GameOverlay::GameOverlay(rex::ui::ImGuiDrawer* drawer) : ImGuiDialog(drawer) {
 
 GameOverlay::~GameOverlay() {
   if (csv_) std::fclose(csv_);
+}
+
+void GameOverlay::SetTitleInputCaptured(bool captured) {
+  if (captured == title_input_captured_) return;
+  title_input_captured_ = captured;
+  if (set_title_input_) set_title_input_(captured);
+}
+
+void GameOverlay::ResetReturnPrompt() {
+  f02::ResetReturnRequest();
+  // The guest-side confirmation controller closes the message box and restores
+  // the pause state on its own thread.
+  f02::RequestConfirmationReset();
+  return_failed_ = false;
+  SetTitleInputCaptured(false);
+}
+
+void GameOverlay::ShowReturnFailure() {
+  return_failed_ = true;
+  f02::ResetReturnRequest();
+  // The title was asked to terminate; do not let the pad drive a half-closed
+  // session.
+  SetTitleInputCaptured(true);
+}
+
+void GameOverlay::UpdateReturnRequest() {
+  if (return_failed_) return;
+  // The guest's native confirmation posts exactly one request on accept. The
+  // guest pause frame is frozen from that point on, so there is nothing to
+  // arbitrate here.
+  if (!f02::ConsumeReturnRequest()) return;
+  REXLOG_INFO("F02: return to hub accepted in the native pause-menu dialog");
+  SetTitleInputCaptured(true);
+  if (return_to_hub_) return_to_hub_();
+}
+
+void GameOverlay::DrawReturnFailure(ImGuiIO& io) {
+  if (!return_failed_) return;
+  const ImVec2 size = io.DisplaySize;
+  const float s = std::min(size.x / 1920.0f, size.y / 1080.0f);
+  const float sw = size.x / s, sh = size.y / s;
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  const auto& fonts = hub::Fonts();
+  ImFont* bold = fonts.body_bold ? fonts.body_bold : ImGui::GetFont();
+  ImFont* body = fonts.body ? fonts.body : ImGui::GetFont();
+  auto P = [&](float x, float y) { return ImVec2(x * s, y * s); };
+  auto Text = [&](ImFont* font, float pixels, float x, float y, ImU32 color, const char* text) {
+    dl->AddText(font, pixels * s, P(x, y), color, text);
+  };
+
+  dl->AddRectFilled(ImVec2(0, 0), size, IM_COL32(0, 0, 0, 170));
+  const float pw = 760, ph = 220;
+  const float px = (sw - pw) * 0.5f, py = (sh - ph) * 0.5f;
+  dl->AddRectFilled(P(px, py), P(px + pw, py + ph), IM_COL32(16, 16, 18, 245), 14 * s);
+  dl->AddRect(P(px, py), P(px + pw, py + ph), IM_COL32(255, 255, 255, 45), 14 * s, 0, 1.5f * s);
+  Text(bold, 34, px + 40, py + 34, IM_COL32(244, 245, 247, 255), "RETURN TO HUB");
+  Text(body, 22, px + 40, py + 96, IM_COL32(220, 222, 226, 230),
+       "This session could not be closed safely.");
+  Text(body, 16, px + 40, py + 132, IM_COL32(200, 202, 208, 160),
+       "Close the game from the PS5's home screen.");
 }
 
 void GameOverlay::Sample() {
@@ -140,6 +207,8 @@ bool GameOverlay::WantsContinuousRepaint() const { return REXCVAR_GET(ps5_overla
 
 void GameOverlay::OnDraw(ImGuiIO& io) {
   Capture();
+  UpdateReturnRequest();
+  DrawReturnFailure(io);
   // (the overlay stays up with the counter off, drawing nothing: the game's
   // frames reach the TV the same way either way)
   const std::string mode = REXCVAR_GET(ps5_fps_counter);

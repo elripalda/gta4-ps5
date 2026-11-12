@@ -14,6 +14,10 @@
 #include <cstdlib>
 
 #include <rex/assert.h>
+#include <rex/platform.h>
+#if REX_PLATFORM_PS5
+#include <rex/ps5_diag.h>
+#endif
 #include <rex/cvar.h>
 #include <rex/ui/flags.h>
 #include <rex/kernel/crt/heap.h>
@@ -36,8 +40,10 @@
 #include <rex/kernel/init.h>
 #include <rex/system.h>
 #include <rex/system/achievement_manager.h>
+#include <rex/system/cooperative_shutdown.h>
 #include <rex/system/gpu_plugin.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/session_restart.h>
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/keybinds.h>
@@ -50,6 +56,7 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <string_view>
 
@@ -263,6 +270,13 @@ bool ReXApp::SetupEnvironment() {
 }
 
 bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+  if (runtime_) {
+    // A live runtime owns guest memory, kernel objects, and the graphics
+    // backend. Replacing it here would destroy them without a cooperative
+    // drain. A relaunch must shut the old runtime down first.
+    REXLOG_ERROR("ConstructRuntime refused: a runtime is already active");
+    return false;
+  }
   if (paths.game_data_root.empty()) {
     auto msg = std::string("--game_data_root was not provided.");
     REXLOG_ERROR("{}", msg);
@@ -400,7 +414,11 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
   return true;
 }
 
-bool ReXApp::SetupPresentation() {
+bool ReXApp::ConfigureGraphicsBackend() {
+  // RuntimeConfig is consumed by the first Runtime::Setup (graphics is moved
+  // out), so both the first launch and a return-to-hub rebuild start from a
+  // fresh config and a fresh backend plugin instance.
+  config_ = RuntimeConfig{};
   config_.gpu_plugin = REXCVAR_GET(gpu_plugin);
 #if REX_PLATFORM_MAC && !REX_PLATFORM_IOS
   config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::coreaudio::CoreAudioAudioSystem);
@@ -431,8 +449,15 @@ bool ReXApp::SetupPresentation() {
       return false;
     }
   }
+  return true;
+}
 
-  // Create window
+bool ReXApp::CreateMainWindow() {
+  if (window_) {
+    // The window, its listeners, and its input binding outlive guest sessions;
+    // only the presenter attached to it is rebuilt.
+    return true;
+  }
   window_ = rex::ui::Window::Create(app_context(), GetName(), 1280, 720);
   if (!window_) {
     REXLOG_ERROR("Failed to create window");
@@ -453,7 +478,10 @@ bool ReXApp::SetupPresentation() {
     REXLOG_ERROR("Failed to open the main window");
     return false;
   }
+  return true;
+}
 
+bool ReXApp::AttachPresentationStack() {
   auto* graphics_system = config_.graphics.get();
   if (graphics_system && graphics_system->presenter()) {
     // SDK mode: the emulated-Xenos presenter drives the overlays.
@@ -477,8 +505,17 @@ bool ReXApp::SetupPresentation() {
       // surface and the present cadence.
     }
   }
-
   return true;
+}
+
+bool ReXApp::SetupPresentation() {
+  if (!ConfigureGraphicsBackend()) {
+    return false;
+  }
+  if (!CreateMainWindow()) {
+    return false;
+  }
+  return AttachPresentationStack();
 }
 
 void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDrawer* drawer) {
@@ -488,39 +525,44 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
   // gated eager font upload in SetImmediateDrawer is skipped (font uploads
   // lazily on the first Draw instead).
   imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
-  rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
-    if (debug_overlay_) {
-      debug_overlay_.reset();
-    } else {
-      debug_overlay_ =
-          std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
-    }
-    PublishInputOverlayState();
-  });
-  rex::ui::RegisterBind("bind_console", "Backtick", "Toggle console overlay", [this] {
-    if (console_overlay_) {
-      console_overlay_.reset();
-    } else {
-      console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
-    }
-    PublishInputOverlayState();
-  });
-  rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay", [this] {
-    if (settings_overlay_) {
-      settings_overlay_.reset();
-    } else {
-      settings_overlay_ = std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
-    }
-    PublishInputOverlayState();
-  });
-  rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
-    if (achievements_overlay_) {
-      achievements_overlay_.reset();
-    } else {
-      achievements_overlay_ = CreateAchievementsOverlay();
-    }
-    PublishInputOverlayState();
-  });
+  if (!overlay_binds_registered_) {
+    // The bind registry is global and ignores duplicate names, so register the
+    // callbacks once; they reach the current session's dialogs through `this`.
+    overlay_binds_registered_ = true;
+    rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
+      if (debug_overlay_) {
+        debug_overlay_.reset();
+      } else {
+        debug_overlay_ =
+            std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
+      }
+      PublishInputOverlayState();
+    });
+    rex::ui::RegisterBind("bind_console", "Backtick", "Toggle console overlay", [this] {
+      if (console_overlay_) {
+        console_overlay_.reset();
+      } else {
+        console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
+      }
+      PublishInputOverlayState();
+    });
+    rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay", [this] {
+      if (settings_overlay_) {
+        settings_overlay_.reset();
+      } else {
+        settings_overlay_ = std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
+      }
+      PublishInputOverlayState();
+    });
+    rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
+      if (achievements_overlay_) {
+        achievements_overlay_.reset();
+      } else {
+        achievements_overlay_ = CreateAchievementsOverlay();
+      }
+      PublishInputOverlayState();
+    });
+  }
 
   OnCreateDialogs(imgui_drawer_.get());
 }
@@ -532,6 +574,17 @@ void ReXApp::PublishInputOverlayState() {
 
 void ReXApp::LaunchModule() {
   app_context().CallInUIThreadDeferred([this]() {
+    // A second launch is only allowed once the previous module thread has
+    // finished. Joining a live thread here would block the UI event loop, so a
+    // live thread is refused instead; the caller must drain it first.
+    if (module_thread_.joinable()) {
+      if (module_thread_live_.load(std::memory_order_acquire)) {
+        REXLOG_ERROR("LaunchModule refused: the previous module thread is still running");
+        return;
+      }
+      module_thread_.join();
+    }
+
     // Register the achievement notification callback now that the runtime and
     // KernelState are guaranteed to exist. Done here (not OnCreateDialogs)
     // because KernelState is null during SetupPresentation.
@@ -578,11 +631,16 @@ void ReXApp::LaunchModule() {
       return;
     }
 
+    module_thread_live_.store(true, std::memory_order_release);
     module_thread_ = std::thread([this, main_thread = std::move(main_thread)]() mutable {
       main_thread->Wait(0, 0, 0, nullptr);
       OnGuestThreadExit(main_thread.get());
       REXLOG_INFO("Execution complete");
-      if (!shutting_down_.load(std::memory_order_acquire)) {
+      module_thread_live_.store(false, std::memory_order_release);
+      // An intentional return to the hub ends the guest thread too; the
+      // process must survive so the hub can start the next session.
+      if (!shutting_down_.load(std::memory_order_acquire) &&
+          !restart_in_progress_.load(std::memory_order_acquire)) {
         app_context().CallInUIThread([this]() { app_context().QuitFromUIThread(); });
       }
     });
@@ -599,6 +657,218 @@ std::function<void(PathConfig)> ReXApp::MakeResumeCallback() {
     }
     LaunchModule();
   };
+}
+
+void ReXApp::ReleasePresentationStack() {
+  // Title globals that own dialogs or immediate textures must go before the
+  // drawers they were created from.
+  OnPresentationTeardown();
+
+  if (achievement_notification_listener_ != 0) {
+    if (runtime_ && runtime_->kernel_state()) {
+      achievements().UnregisterCallback(achievement_notification_listener_);
+    }
+    achievement_notification_listener_ = 0;
+  }
+  achievement_notification_.reset();
+  achievements_overlay_.reset();
+  settings_overlay_.reset();
+  console_overlay_.reset();
+  debug_overlay_.reset();
+
+  if (imgui_drawer_) {
+    imgui_drawer_->SetPresenterAndImmediateDrawer(nullptr, nullptr);
+    imgui_drawer_.reset();
+  }
+  // The drawer detaches from the presenter before the runtime destroys it; in
+  // detached mode it never had one.
+  if (immediate_drawer_) {
+    immediate_drawer_->SetPresenter(nullptr);
+    immediate_drawer_.reset();
+  }
+  if (runtime_) {
+    runtime_->set_display_window(nullptr);
+    runtime_->set_imgui_drawer(nullptr);
+  }
+  if (window_) {
+    window_->SetPresenter(nullptr);
+  }
+  PublishInputOverlayState();
+}
+
+bool ReXApp::RebuildPresentationStack() {
+  if (!window_) {
+    REXLOG_ERROR("F02 restart: cannot rebuild presentation without a window");
+    return false;
+  }
+  if (!ConfigureGraphicsBackend()) {
+    return false;
+  }
+  return AttachPresentationStack();
+}
+
+bool ReXApp::RestartSessionForHub(std::function<void(bool)> completion) {
+  if (!app_context().IsInUIThread()) {
+    REXLOG_ERROR("F02 restart refused: not on the UI thread");
+    return false;
+  }
+  if (shutting_down_.load(std::memory_order_acquire)) {
+    REXLOG_ERROR("F02 restart refused: the process is closing");
+    return false;
+  }
+  if (!runtime_ || !window_) {
+    REXLOG_WARN("F02 restart refused: no active guest session");
+    return false;
+  }
+  bool expected = false;
+  if (!restart_in_progress_.compare_exchange_strong(expected, true)) {
+    REXLOG_WARN("F02 restart refused: a return is already in progress");
+    return false;
+  }
+
+  const uint32_t generation = session_generation_.load(std::memory_order_acquire);
+  REXLOG_INFO("F02 restart: begin generation={} runtime={}", generation + 1,
+              fmt::ptr(runtime_.get()));
+
+  // A thread left over from a session that ended by itself can be joined now;
+  // a live one is the expected case and exits during the drain.
+  if (module_thread_.joinable() && !module_thread_live_.load(std::memory_order_acquire)) {
+    module_thread_.join();
+  }
+
+  auto sequence = std::make_shared<system::SessionRestartSequence>();
+  sequence->Begin();
+
+  // The drain and save barrier happen on a worker so the UI thread can serve
+  // the graphics system's synchronous presenter teardown. The completion is
+  // always posted back to the UI thread.
+  std::thread worker([this, sequence, generation,
+                      completion = std::move(completion)]() mutable {
+    system::ShutdownReport report;
+    report.status = system::ShutdownStatus::kComplete;
+    if (runtime_) {
+      auto release_presentation = [this, sequence] {
+        // Only after the drain and the save barrier proved clean: stop the
+        // title's workers and detach every object that still points at the
+        // graphics system. A blocked result never reaches this point, so the
+        // title keeps its session resources for a retry.
+        if (module_thread_.joinable()) {
+          module_thread_.join();
+        }
+        app_context().CallInUIThreadSynchronous([this, sequence] {
+          OnSessionEnding();
+          sequence->CompleteStep(true);  // quiesce-session
+          ReleasePresentationStack();
+          sequence->CompleteStep(true);  // release-presentation
+        });
+      };
+      // One retry: the first attempt already asked the guest to terminate, so
+      // a drain or save barrier that was still busy usually finishes shortly.
+      // A blocked result destroyed nothing and kept the save gate closed, so a
+      // second attempt cannot start new work behind the gate.
+      for (int attempt = 0; attempt < 2; ++attempt) {
+        const uint32_t guest_ms = attempt == 0 ? 15000 : 5000;
+        const auto save_ms = std::chrono::milliseconds(attempt == 0 ? 15000 : 5000);
+        report = runtime_->ShutdownCooperatively(guest_ms, save_ms, release_presentation);
+        if (report.complete() ||
+            report.status == system::ShutdownStatus::kReleasedIncomplete) {
+          // The presentation is gone; report incomplete teardown without relaunching.
+          break;
+        }
+        REXLOG_WARN(
+            "F02 restart: shutdown blocked (status={}) on attempt {}; the guest was already "
+            "asked to terminate, retrying",
+            static_cast<int>(report.status), attempt + 1);
+      }
+    }
+
+    if (!report.complete()) {
+      const bool release_incomplete =
+          report.status == system::ShutdownStatus::kReleasedIncomplete;
+      sequence->CompleteStep(false);  // stop-runtime → kShutdownBlocked
+      if (release_incomplete) {
+        REXLOG_ERROR(
+            "F02 restart: teardown retained the memory owner (status={}); "
+            "the presentation is gone and no new session may start",
+            static_cast<int>(report.status));
+      } else {
+        REXLOG_ERROR(
+            "F02 restart: runtime did not shut down cleanly (status={}); "
+            "keeping the process on the existing session resources",
+            static_cast<int>(report.status));
+      }
+      app_context().CallInUIThread([this, release_incomplete, failure = sequence->failure(),
+                                    completion = std::move(completion)]() mutable {
+        REXLOG_ERROR("F02 restart: blocked ({})",
+                     system::SessionRestartFailureName(failure));
+        restart_in_progress_.store(false, std::memory_order_release);
+        completion(false);
+        if (release_incomplete) {
+          // Retained kernel resources must not be reused by another title.
+          REXLOG_ERROR("F02 restart: closing the app instead of returning to the hub");
+          app_context().QuitFromUIThread();
+        }
+      });
+      return;
+    }
+    sequence->CompleteStep(true);  // stop-runtime
+
+    if (module_thread_.joinable()) {
+      module_thread_.join();
+    }
+    sequence->CompleteStep(true);  // join-module-thread
+
+    // Shutdown() already destroyed the subsystems; the Runtime object itself
+    // must go so ConstructRuntime's single-session guard can admit the next
+    // title. This runs on the worker, which owns no UI objects.
+    runtime_.reset();
+    sequence->CompleteStep(true);  // reset-runtime
+
+    app_context().CallInUIThread(
+        [this, sequence, generation, completion = std::move(completion)]() mutable {
+          const bool rebuilt = RebuildPresentationStack();
+          sequence->CompleteStep(rebuilt);  // rebuild-presentation
+          restart_in_progress_.store(false, std::memory_order_release);
+          if (!rebuilt) {
+            // The old session is gone and the presentation cannot come back:
+            // the process has nothing left to show or resume. Quit cleanly
+            // instead of leaving a window with no drawer.
+            REXLOG_ERROR("F02 restart: presentation rebuild failed ({}); closing the app",
+                         system::SessionRestartFailureName(sequence->failure()));
+            app_context().QuitFromUIThread();
+            return;
+          }
+          sequence->CompleteStep(true);  // resume-host-ui
+          session_generation_.store(generation + 1, std::memory_order_release);
+          REXLOG_INFO("F02 restart: session {} is ready for the hub", generation + 1);
+          completion(true);
+        });
+  });
+  worker.detach();
+  return true;
+}
+
+bool ReXApp::StartSessionAfterReturn(const PathConfig& paths) {
+  if (!app_context().IsInUIThread()) {
+    REXLOG_ERROR("F02 start refused: not on the UI thread");
+    return false;
+  }
+  if (shutting_down_.load(std::memory_order_acquire) ||
+      restart_in_progress_.load(std::memory_order_acquire)) {
+    REXLOG_ERROR("F02 start refused: a return or shutdown is in progress");
+    return false;
+  }
+  if (runtime_) {
+    REXLOG_ERROR("F02 start refused: a runtime is already active");
+    return false;
+  }
+  if (!ConstructRuntime(paths)) {
+    REXLOG_ERROR("F02 start: the next session's runtime could not be constructed");
+    return false;
+  }
+  LaunchModule();
+  REXLOG_INFO("F02 start: session {} launched", session_generation_.load(std::memory_order_acquire));
+  return true;
 }
 
 void ReXApp::OnKeyDown(ui::KeyEvent& e) {

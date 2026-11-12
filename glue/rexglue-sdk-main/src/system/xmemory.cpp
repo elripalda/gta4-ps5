@@ -16,6 +16,7 @@
 #include <rex/system/thread_state.h>
 #endif
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <utility>
 
@@ -34,6 +35,15 @@
 #include <rex/system/mmio_handler.h>
 #include <rex/system/xmemory.h>
 #include <rex/thread.h>
+
+#if REX_PLATFORM_PS5
+// [ps5 port] Guest memory in PS5 direct memory through libps5platform's
+// shared memory objects (as UnleashedRecomp-Prospero maps its guest): an
+// app's ordinary shared/anonymous memory comes from a small flexible pool,
+// too little for the Xbox 360's RAM.
+#include <ps5platform/shm.h>
+
+#endif
 
 // TODO(benvanik): move xbox.h out
 #include <rex/system/xtypes.h>
@@ -106,15 +116,21 @@ Memory::Memory() {
 
 Memory::~Memory() {
   assert_true(active_memory_ == this);
+#if REX_PLATFORM_PS5
+  if (!ReleaseGuestMappings()) {
+    rex::FatalError("Guest memory still owns kernel resources; refusing to discard its owner");
+  }
+#endif
   active_memory_ = nullptr;
 
-  // Uninstall the MMIO handler, as we won't be able to service more requests.
   mmio_handler_.reset();
 
   for (auto invalidation_callback : physical_memory_invalidation_callbacks_) {
     delete invalidation_callback;
   }
 
+#if !REX_PLATFORM_PS5
+  // PS5 owns complete mirrored views, not independently releasable heap regions.
   heaps_.v00000000.Dispose();
   heaps_.v40000000.Dispose();
   heaps_.v80000000.Dispose();
@@ -123,15 +139,14 @@ Memory::~Memory() {
   heaps_.vC0000000.Dispose();
   heaps_.vE0000000.Dispose();
   heaps_.physical.Dispose();
+#endif
 
-  // Unmap all views and close mapping.
+  UnmapViews();
   if (mapping_ != rex::memory::kFileMappingHandleInvalid) {
-    UnmapViews();
     rex::memory::CloseFileMappingHandle(mapping_, file_name_);
-    mapping_base_ = nullptr;
     mapping_ = rex::memory::kFileMappingHandleInvalid;
   }
-
+  mapping_base_ = nullptr;
   virtual_membase_ = nullptr;
   physical_membase_ = nullptr;
 }
@@ -334,14 +349,14 @@ constexpr size_t kGuestMappingLength = 0x120000000ull;
 }  // namespace
 
 #if REX_PLATFORM_PS5
-// [ps5 port] Guest memory in PS5 direct memory through libps5platform's
-// shared memory objects (as UnleashedRecomp-Prospero maps its guest): an
-// app's ordinary shared/anonymous memory comes from a small flexible pool,
-// too little for the Xbox 360's RAM.
-#include <ps5platform/shm.h>
-#endif
+namespace {
+std::atomic<bool> g_ps5_last_teardown_complete{true};
+}  // namespace
 
-#if REX_PLATFORM_PS5
+bool LastPs5TeardownReleasedEverything() {
+  return g_ps5_last_teardown_complete.load(std::memory_order_acquire);
+}
+
 // [ps5 port] Reserve the guest range, then map each view into it with
 // MAP_FIXED, in direct memory when there is room (as in the SvR 2011 PS5 port).
 int Memory::MapViewsPs5() {
@@ -355,17 +370,20 @@ int Memory::MapViewsPs5() {
 
   // [ps5 port] Address space only (near 64 GiB, like Sonic's port).
   void* reserved_base = nullptr;
-  if (ps5_vrange_reserve(total_size, reinterpret_cast<void*>(0x1000000000ull), 0x10000,
-                         &reserved_base) != 0 ||
-      !reserved_base) {
+  ps5_reserved_range_ =
+      ps5_vrange_reserve(total_size, reinterpret_cast<void*>(0x1000000000ull), 0x10000,
+                         &reserved_base) == 0 && reserved_base;
+  if (!ps5_reserved_range_) {
     reserved_base = mmap(nullptr, total_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   }
   if (reserved_base == MAP_FAILED) {
     REXSYS_ERROR("MapViewsPs5: reserve failed: {}", std::strerror(errno));
     return 1;
   }
+  ps5_arena_ = reserved_base;
   rex::ps5diag::guest_arena_lo = reinterpret_cast<uintptr_t>(reserved_base);
   rex::ps5diag::guest_arena_hi = reinterpret_cast<uintptr_t>(reserved_base) + total_size;
+  for (auto& state : ps5_view_state_) state = Ps5ViewState::kNone;
 
   uint8_t* mapping_base = reinterpret_cast<uint8_t*>(reserved_base);
   uint64_t granularity_mask = ~uint64_t(system_allocation_granularity_ - 1);
@@ -376,13 +394,13 @@ int Memory::MapViewsPs5() {
     // guest virtual (views 0-1), the XEX (3-4) and physical memory (2, 5-8).
     struct Region {
       uint64_t start, size;
-      ps5_shm shm;
+      ps5_shm& shm;
       bool ok;
     };
-    Region regions[3] = {{0x000000000ull, 0x07F000000ull, {}, false},
-                         {0x080000000ull, 0x010000000ull, {}, false},
-                         {0x100000000ull, 0x020000000ull + 0x10000, {}, false}};
-    ps5_shm whole{};
+    Region regions[3] = {{0x000000000ull, 0x07F000000ull, ps5_backing_[1], false},
+                         {0x080000000ull, 0x010000000ull, ps5_backing_[2], false},
+                         {0x100000000ull, 0x020000000ull + 0x10000, ps5_backing_[3], false}};
+    ps5_shm& whole = ps5_backing_[0];
     bool use_whole = ps5_shm_create(0x120000000ull + 0x10000, &whole) == 0;
     bool regions_ok = use_whole;
     if (!use_whole) {
@@ -420,6 +438,7 @@ int Memory::MapViewsPs5() {
         break;
       }
       views_.all_views[n] = reinterpret_cast<uint8_t*>(view);
+      ps5_view_state_[n] = Ps5ViewState::kLive;
     }
     if (mapped) {
       REXSYS_INFO("PS5: guest memory in direct memory ({})",
@@ -442,11 +461,14 @@ int Memory::MapViewsPs5() {
         *wa = saved;
         REXSYS_INFO("PS5: mirror {}: {}", p.name, seen == 0x5A17C0DE ? "ok" : "BROKEN");
       }
+      g_ps5_last_teardown_complete.store(true, std::memory_order_release);
       return 0;
     }
     REXSYS_ERROR("PS5: no direct memory for the guest ({})",
                  regions_ok ? "mapping failed" : "allocation failed");
+    if (!ReleasePs5Backing()) return 1;
     if (mapping_ == rex::memory::kFileMappingHandleInvalid) {
+      UnmapViews();
       return 1;
     }
   }
@@ -464,10 +486,7 @@ int Memory::MapViewsPs5() {
           "MapViewsPs5: map failed view {} addr 0x{:016X} size 0x{:X} offset 0x{:X} err {} ({})", n,
           reinterpret_cast<uintptr_t>(target_address), view_size, file_offset, err,
           std::strerror(err));
-      munmap(reserved_base, total_size);
-      for (auto& view : views_.all_views) {
-        view = nullptr;
-      }
+      UnmapViews();
       return 1;
     }
     views_.all_views[n] = reinterpret_cast<uint8_t*>(result);
@@ -542,13 +561,108 @@ int Memory::MapViews(uint8_t* mapping_base) {
   return 0;
 }
 
+#if REX_PLATFORM_PS5
+bool Memory::ReleaseGuestMappings() {
+  mmio_handler_.reset();
+  UnmapViews();
+  return LastPs5TeardownReleasedEverything();
+}
+
+bool Memory::ReleasePs5Backing() {
+  bool has_backing = false;
+  for (const auto& backing : ps5_backing_) has_backing |= backing.bytes != 0;
+  if (!has_backing) return true;
+
+  for (size_t n = 0; n < rex::countof(views_.all_views); ++n) {
+    const Ps5ViewState state = ps5_view_state_[n];
+    // kNone and kReservedHole own no live alias; kUncertain was unmapped but
+    // its range was not re-reserved, so it must never be unmapped again.
+    if (state == Ps5ViewState::kNone || state == Ps5ViewState::kReservedHole) continue;
+    if (state == Ps5ViewState::kUncertain) {
+      REXSYS_ERROR(
+          "PS5: direct view {} was unmapped but its range ownership is unknown; retaining the "
+          "backing object",
+          n);
+      rex::FlushLogging();
+      return false;
+    }
+    const size_t length = map_info[n].virtual_address_end - map_info[n].virtual_address_start + 1;
+    ps5_shm_unmap_report report = {};
+    const int rc = ps5_shm_unmap_reported(views_.all_views[n], length, PS5_SHM_KEEP_RESERVED,
+                                          &report);
+    if (report.unmap_result != 0) {
+      REXSYS_ERROR("PS5: direct view {} unmap failed rc={:#x}; retaining the backing object", n,
+                   report.unmap_result);
+      rex::FlushLogging();
+      return false;
+    }
+    // Successful unmap ends live ownership even when re-reservation fails.
+    views_.all_views[n] = nullptr;
+    if (rc != 0 || report.reserve_result != 0) {
+      ps5_view_state_[n] = Ps5ViewState::kUncertain;
+      REXSYS_ERROR(
+          "PS5: direct view {} was unmapped but the range was not reserved again rc={:#x} "
+          "at={}; the teardown cannot complete",
+          n, report.reserve_result, report.reserve_address);
+      rex::FlushLogging();
+      return false;
+    }
+    ps5_view_state_[n] = Ps5ViewState::kReservedHole;
+  }
+
+  for (auto& backing : ps5_backing_) {
+    if (!backing.bytes) continue;
+    const int rc = ps5_shm_destroy_reported(&backing);
+    if (rc != 0) {
+      REXSYS_ERROR("PS5: backing release failed rc={:#x}; the teardown cannot complete", rc);
+      rex::FlushLogging();
+      return false;
+    }
+  }
+  return true;
+}
+#endif
+
 void Memory::UnmapViews() {
+#if REX_PLATFORM_PS5
+  bool released = ReleasePs5Backing();
+  if (!released) {
+    REXSYS_ERROR("PS5: retaining guest backing after failed view unmap");
+    rex::FlushLogging();
+  }
+  if (released && ps5_arena_) {
+    const int rc = ps5_reserved_range_
+                       ? ps5_vrange_release(ps5_arena_, kGuestMappingLength)
+                       : munmap(ps5_arena_, kGuestMappingLength);
+    if (rc != 0) {
+      released = false;
+    } else {
+      ps5_arena_ = nullptr;
+      ps5_reserved_range_ = false;
+    }
+  }
+  if (!released) {
+    REXSYS_ERROR(
+        "PS5: guest memory teardown incomplete; no view is reused and no new session may start "
+        "in this process");
+    rex::FlushLogging();
+    g_ps5_last_teardown_complete.store(false, std::memory_order_release);
+    return;
+  }
+  for (auto& view : views_.all_views) view = nullptr;
+  for (auto& state : ps5_view_state_) state = Ps5ViewState::kNone;
+  rex::ps5diag::guest_arena_lo = 0;
+  rex::ps5diag::guest_arena_hi = 0;
+  g_ps5_last_teardown_complete.store(true, std::memory_order_release);
+#else
   for (size_t n = 0; n < rex::countof(views_.all_views); n++) {
     if (views_.all_views[n]) {
       size_t length = map_info[n].virtual_address_end - map_info[n].virtual_address_start + 1;
       rex::memory::UnmapFileView(mapping_, views_.all_views[n], length);
+      views_.all_views[n] = nullptr;
     }
   }
+#endif
 }
 
 void Memory::Reset() {

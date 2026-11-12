@@ -12,13 +12,38 @@
 #include <rex/filesystem/devices/host_path_entry.h>
 #include <rex/filesystem/devices/host_path_file.h>
 
+#include <rex/filesystem/devices/host_path_device.h>
+
 namespace rex::filesystem {
 
 HostPathFile::HostPathFile(uint32_t file_access, HostPathEntry* entry,
                            std::unique_ptr<rex::filesystem::FileHandle> file_handle)
-    : File(file_access, entry), file_handle_(std::move(file_handle)) {}
+    : File(file_access, entry), file_handle_(std::move(file_handle)) {
+  constexpr uint32_t kWriteAccess =
+      FileAccess::kGenericWrite | FileAccess::kFileWriteData | FileAccess::kFileAppendData;
+  if (!(file_access & kWriteAccess)) {
+    return;
+  }
 
-HostPathFile::~HostPathFile() = default;
+  auto* device = static_cast<HostPathDevice*>(entry->device());
+  write_tracker_ = device->write_tracker();
+  if (!write_tracker_) {
+    return;
+  }
+
+  tracked_path_ = entry->host_path();
+  write_tracker_->Begin(tracked_path_);
+}
+
+HostPathFile::~HostPathFile() {
+  if (!write_tracker_) {
+    return;
+  }
+  // All guest writes are synchronous, so the handle's contents are complete
+  // here; flush before declaring the write finished.
+  file_handle_->Flush();
+  write_tracker_->End(tracked_path_);
+}
 
 void HostPathFile::Destroy() {
   delete this;

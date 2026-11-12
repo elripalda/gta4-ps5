@@ -23,6 +23,9 @@
 #include <rex/ppc/context.h>  // PPCFunc type (minimal header)
 #include <rex/system/mmio_handler.h>
 #include <rex/thread/mutex.h>
+#if REX_PLATFORM_PS5
+#include <ps5platform/shm.h>
+#endif
 
 namespace rex::stream {
 class ByteStream;
@@ -351,6 +354,9 @@ class Memory {
   // This may fail if the host address space could not be reserved or the
   // mapping to the file system fails.
   bool Initialize();
+#if REX_PLATFORM_PS5
+  bool ReleaseGuestMappings();
+#endif
 
   // Resets all memory to zero and resets all allocations.
   void Reset();
@@ -574,6 +580,26 @@ class Memory {
 
   rex::memory::FileMappingHandle mapping_ = rex::memory::kFileMappingHandleInvalid;
   uint8_t* mapping_base_ = nullptr;
+#if REX_PLATFORM_PS5
+  // Ownership of one direct view during teardown. The kernel operations are
+  // split (unmap, then a fixed re-reservation that keeps the hole), so a
+  // failed step cannot be treated as "still mapped" or "gone":
+  //   kLive          mapped; an alias of a backing object;
+  //   kReservedHole  unmapped; the range is reserved again and owned;
+  //   kUncertain     unmapped; the re-reservation failed, the range's
+  //                  ownership is unknown, and it is never retried blindly.
+  enum class Ps5ViewState : uint8_t {
+    kNone,
+    kLive,
+    kReservedHole,
+    kUncertain,
+  };
+  bool ReleasePs5Backing();
+  ps5_shm ps5_backing_[4]{};
+  Ps5ViewState ps5_view_state_[9] = {};
+  void* ps5_arena_ = nullptr;
+  bool ps5_reserved_range_ = false;
+#endif
   union {
     struct {
       uint8_t* v00000000;
@@ -610,5 +636,10 @@ class Memory {
   std::vector<std::pair<PhysicalMemoryInvalidationCallback, void*>*>
       physical_memory_invalidation_callbacks_;
 };
+
+#if REX_PLATFORM_PS5
+// False while guest mappings remain owned; runtime replacement must wait.
+bool LastPs5TeardownReleasedEverything();
+#endif
 
 }  // namespace rex::memory

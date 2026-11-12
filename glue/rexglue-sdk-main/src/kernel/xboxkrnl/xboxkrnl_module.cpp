@@ -25,6 +25,7 @@
 #include <rex/kernel/xboxkrnl/debug_monitor.h>
 #include <rex/kernel/xboxkrnl/module.h>
 #include <rex/kernel/xboxkrnl/private.h>
+#include <rex/kernel/xboxkrnl/vdhsio_watch.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -59,11 +60,13 @@ bool XboxkrnlModule::SendPIXCommand(const char* cmd) {
 }
 
 XboxkrnlModule::XboxkrnlModule(Runtime* emulator, KernelState* kernel_state)
-    : KernelModule(kernel_state, "xe:\\xboxkrnl.exe"), timestamp_timer_(nullptr) {
+    : KernelModule(kernel_state, "xe:\\xboxkrnl.exe"),
+      hsio_watch_(std::make_unique<VdHsioLockWatcher>()),
+      timestamp_timer_(nullptr) {
   RegisterExportTable(export_resolver_);
 
   // Register video variable exports (VdGlobalDevice, VdGpuClockInMHz, etc.)
-  RegisterVideoExports(export_resolver_, kernel_state_);
+  RegisterVideoExports(export_resolver_, kernel_state_, hsio_watch_.get());
 
   // KeDebugMonitorData (?*)
   // Set to a valid value when a remote debugger is attached.
@@ -258,6 +261,13 @@ void XboxkrnlModule::RegisterExportTable(rex::runtime::ExportResolver* export_re
   export_resolver->RegisterTable("xboxkrnl.exe", &xboxkrnl_exports);
 }
 
-XboxkrnlModule::~XboxkrnlModule() = default;
+XboxkrnlModule::~XboxkrnlModule() {
+  // The watcher samples guest SystemHeap memory. Kernel teardown runs before
+  // Runtime releases the memory views, so joining here keeps the pointer valid
+  // for the whole lifetime of the worker.
+  if (hsio_watch_) {
+    hsio_watch_->Stop();
+  }
+}
 
 }  // namespace rex::kernel::xboxkrnl

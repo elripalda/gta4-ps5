@@ -794,3 +794,8 @@ CMakeUserPresets.json
 !/tools/tests/test_metal_shader_archive.py
 !/tools/vulkan/*.py
 !/glue/rexglue-sdk-main/cmake/fidelityfx_shader_compiler.py
+!/glue/rexglue-sdk-main/tests/unit/system/f02_*_test.py
+!/glue/rexglue-sdk-main/tests/unit/system/gta4_motion_registration_test.py
+!/ps5/tools/prepare_f02_sdk.py
+!/ps5/tools/run_f02_host_gates.py
+!/ps5/tools/ps5_package.sh

@@ -58,7 +58,6 @@ struct ThreadEntry {
   std::atomic<bool> used{false};
   pthread_t pthread{};
   int tid = 0;
-  uintptr_t stack_top = 0;
   char what[24] = {};
   // filled by the signal handler
   std::atomic<int> done{0};
@@ -147,10 +146,22 @@ void FindPassThroughs() {
   NotePassThrough(reinterpret_cast<const void*>(delete_sized), 128);
 }
 
+std::mutex sample_pass_mutex;
+unsigned sample_pause_depth = 0;
+
 void SampleHandler(int, siginfo_t*, void* uc) {
   ThreadEntry* e = my_entry;
   if (!e) return;
   auto* gregs = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(uc) + 64);
+  if (!stack_sample_gate.Enter()) {
+    if (e->want_stack.exchange(false, std::memory_order_acq_rel)) {
+      e->rip = gregs[20];
+      e->rsp = gregs[23];
+      e->nwords = 0;
+      e->done.store(1, std::memory_order_release);
+    }
+    return;
+  }
   if (!e->want_stack.load(std::memory_order_acquire)) {
     // a profiler sample: where the thread is, nothing else
     // (The eboot loads low on the PS5, below kNear: anchor - kNear would
@@ -163,8 +174,7 @@ void SampleHandler(int, siginfo_t*, void* uc) {
       // In the game: note the nearest return address into it in another
       // block, most often its caller (malloc's, a shared_ptr release's).
       const uintptr_t rsp = gregs[23] & ~uintptr_t(7);
-      uintptr_t end = rsp + 24 * 8;
-      if (e->stack_top && e->stack_top < end) end = e->stack_top;
+      const uintptr_t end = StackScanEnd(rsp, 24 * 8);
       for (uintptr_t p = rsp; p + 8 <= end; p += 8) {
         const uintptr_t v = *reinterpret_cast<const uintptr_t*>(p);
         if (v > lo && v < anchor + kNear) {
@@ -186,8 +196,7 @@ void SampleHandler(int, siginfo_t*, void* uc) {
       // stack, marked with the top bit; and note the next one in another
       // block, its likely caller.
       const uintptr_t rsp = gregs[23] & ~uintptr_t(7);
-      uintptr_t end = rsp + 40 * 8;
-      if (e->stack_top && e->stack_top < end) end = e->stack_top;
+      const uintptr_t end = StackScanEnd(rsp, 40 * 8);
       for (uintptr_t p = rsp; p + 8 <= end; p += 8) {
         const uintptr_t v = *reinterpret_cast<const uintptr_t*>(p);
         if (v > lo && v < anchor + kNear) {
@@ -206,14 +215,14 @@ void SampleHandler(int, siginfo_t*, void* uc) {
     e->profile_parent[n % ThreadEntry::kProfileSamples] = parent;
     e->profile[n % ThreadEntry::kProfileSamples] = rel;
     e->profile_count.store(n + 1, std::memory_order_release);
+    stack_sample_gate.Leave();
     return;
   }
   e->want_stack.store(false, std::memory_order_release);
   e->rip = gregs[20];
   e->rsp = gregs[23];
   uintptr_t anchor = Anchor();
-  uintptr_t end = e->rsp + 64 * 1024;
-  if (e->stack_top && e->stack_top < end) end = e->stack_top;
+  const uintptr_t end = StackScanEnd(e->rsp, 64 * 1024);
   int n = 0;
   for (uintptr_t p = e->rsp & ~uintptr_t(7); p + 8 <= end && n < 64; p += 8) {
     uintptr_t v = *reinterpret_cast<uintptr_t*>(p);
@@ -221,8 +230,11 @@ void SampleHandler(int, siginfo_t*, void* uc) {
   }
   e->nwords = n;
   e->done.store(1, std::memory_order_release);
+  stack_sample_gate.Leave();
 }
 }  // namespace
+
+StackSampleGate stack_sample_gate;
 
 namespace {
 std::mutex cs_mutex;
@@ -307,9 +319,8 @@ void UnhandledHostFault(uintptr_t rip, uintptr_t address, uintptr_t rsp) {
   line.Add(", anchor-relative ");
   line.Hex(rip - anchor + 0x10000000);
   line.Add(") | stack:");
-  if (ThreadEntry* e = my_entry) {
-    uintptr_t end = rsp + 64 * 1024;
-    if (e->stack_top && e->stack_top < end) end = e->stack_top;
+  if (my_entry && rsp >= 4096) {
+    const uintptr_t end = StackScanEnd(rsp, 64 * 1024);
     int k = 0;
     for (uintptr_t p = rsp & ~uintptr_t(7); p + 8 <= end && k < 48; p += 8) {
       uintptr_t v = *reinterpret_cast<uintptr_t*>(p);
@@ -347,6 +358,7 @@ void InstallSampleHandler() {
 
 void ProfileTick() {
   InstallSampleHandler();
+  if (stack_sample_gate.suspended.load(std::memory_order_seq_cst)) return;
   const int count = std::min(next_thread.load(), kThreads);
   for (int i = 0; i < count; ++i) {
     ThreadEntry& e = threads[i];
@@ -503,8 +515,6 @@ void RegisterThread(const char* what) {
   ThreadEntry& e = threads[i];
   e.pthread = pthread_self();
   e.tid = pthread_getthreadid_np();
-  int marker = 0;
-  e.stack_top = reinterpret_cast<uintptr_t>(&marker) + 256;  // (a little above: the caller's frame)
   std::strncpy(e.what, what ? what : "", sizeof(e.what) - 1);
   my_entry = &e;
   e.used.store(true, std::memory_order_release);
@@ -547,9 +557,9 @@ void KeepOtherThreadsOn(uint64_t mask, uintptr_t title_thread, uintptr_t main_th
 }
 
 void SampleAllThreads() {
-  static std::mutex sampling;  // the stall watcher and the hang monitor
-  std::lock_guard<std::mutex> one_at_a_time(sampling);
+  std::lock_guard<std::mutex> one_at_a_time(sample_pass_mutex);
   InstallSampleHandler();
+  if (stack_sample_gate.suspended.load(std::memory_order_seq_cst)) return;
   REXLOG_INFO("ps5 stack: anchor {:X}", Anchor());
   int count = next_thread.load();
   if (count > kThreads) count = kThreads;
@@ -572,6 +582,20 @@ void SampleAllThreads() {
     }
     REXLOG_INFO("ps5 stack: tid {} {}: rip {:X} |{}", e.tid, e.what,
                 e.rip - Anchor() + 0x10000000, line);
+  }
+}
+
+void SuspendStackSampling() {
+  std::lock_guard<std::mutex> one_at_a_time(sample_pass_mutex);
+  ++sample_pause_depth;
+  stack_sample_gate.suspended.store(true, std::memory_order_seq_cst);
+  stack_sample_gate.WaitForReaders();
+}
+
+void ResumeStackSampling() {
+  std::lock_guard<std::mutex> one_at_a_time(sample_pass_mutex);
+  if (--sample_pause_depth == 0) {
+    stack_sample_gate.suspended.store(false, std::memory_order_seq_cst);
   }
 }
 }  // namespace rex::ps5diag

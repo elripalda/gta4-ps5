@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -946,30 +947,43 @@ void KernelState::SignalAllWaitableObjects() {
   }
 }
 
-void KernelState::WaitForThreadsToExit(const std::vector<object_ref<XThread>>& threads,
-                                       uint32_t timeout_ms) {
-  using clock = std::chrono::steady_clock;
-  auto deadline = clock::now() + std::chrono::milliseconds(timeout_ms);
-
-  for (;;) {
-    bool all_exited = true;
-    for (auto& thread : threads) {
-      if (thread->is_running()) {
-        all_exited = false;
-        break;
-      }
-    }
-    if (all_exited || clock::now() >= deadline) {
-      return;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+DrainResult KernelState::WaitForThreadsToExit(const std::vector<object_ref<XThread>>& threads,
+                                              uint32_t timeout_ms) {
+  std::vector<uint32_t> thread_ids;
+  thread_ids.reserve(threads.size());
+  for (const auto& thread : threads) {
+    thread_ids.push_back(thread->thread_id());
   }
+
+  // F02 in-process return: name each guest thread the moment it proves full
+  // exit. A crash during the drain then still says who was already gone and who
+  // was still running.
+  std::vector<bool> reported(threads.size(), false);
+  return DrainCooperatively(
+      thread_ids,
+      [&threads, &reported](uint32_t thread_id) {
+        for (size_t i = 0; i < threads.size(); ++i) {
+          const auto& thread = threads[i];
+          if (thread->thread_id() == thread_id) {
+            // The exit token precedes pthread_exit and its remaining destructors.
+            const bool exited =
+                thread->host_exited() &&
+                rex::thread::Wait(thread->thread(), false, std::chrono::milliseconds(0)) ==
+                    rex::thread::WaitResult::kSuccess;
+            if (exited && !reported[i]) {
+              reported[i] = true;
+            }
+            return !exited;
+          }
+        }
+        return false;
+      },
+      std::chrono::milliseconds(timeout_ms), [] { return std::chrono::steady_clock::now(); },
+      [](std::chrono::milliseconds delay) { std::this_thread::sleep_for(delay); });
 }
 
-void KernelState::TerminateTitle() {
+DrainResult KernelState::TerminateTitle(uint32_t timeout_ms) {
   REXSYS_DEBUG("KernelState::TerminateTitle");
-
-  constexpr uint32_t kCooperativeExitTimeoutMs = 200;
 
   // Admission and cooperative guest exit are separate phases. Publishing
   // terminating_title_ first would let CheckTitleTermination call Exit and
@@ -990,12 +1004,12 @@ void KernelState::TerminateTitle() {
   LogHostIoStatistics();
   terminating_title_.store(true, std::memory_order_release);
 
-  // Retained so a thread that wakes and exits below can't be freed mid-drain.
+  // Include exit-token publishers: they still need a host join before teardown.
   std::vector<object_ref<XThread>> target_threads;
   {
     auto global_lock = global_critical_region_.Acquire();
     for (auto& [id, thread] : threads_by_id_) {
-      if (!XThread::IsInThread(thread) && thread->is_guest_thread() && thread->is_running()) {
+      if (!XThread::IsInThread(thread) && thread->is_guest_thread() && thread->has_started()) {
         target_threads.push_back(retain_object(thread));
       }
     }
@@ -1005,20 +1019,36 @@ void KernelState::TerminateTitle() {
   // callback per target (alertable waits/delays).
   SignalAllWaitableObjects();
   for (auto& thread : target_threads) {
-    thread->thread()->QueueUserCallback([] {});
+    if (!thread->host_exited()) thread->thread()->QueueUserCallback([] {});
   }
 
-  WaitForThreadsToExit(target_threads, kCooperativeExitTimeoutMs);
+  const DrainResult drain = WaitForThreadsToExit(target_threads, timeout_ms);
+  if (!drain.clean()) {
+    std::string survivors;
+    for (const uint32_t thread_id : drain.surviving_threads) {
+      survivors += fmt::format(" {:08X}", thread_id);
+    }
+    REXSYS_WARN(
+        "Title termination: {} of {} guest thread(s) did not prove full exit within {} ms:{}; "
+        "they are left running and stay registered",
+        drain.surviving_threads.size(), drain.requested_threads, drain.waited.count(), survivors);
+  }
 
   // Stragglers are deliberately left running, never force-killed: TerminateThread
   // orphans whatever host lock the thread holds (CRT heap, mutexes) and deadlocks
-  // teardown. Window close hard-exits and lets the OS reap them.
+  // teardown. They stay in the thread map so a repeated termination can observe
+  // them, and their own exit unregisters them.
 
-  // Drop guest threads from the map.
+  // Drop guest threads that have fully exited; keep anyone whose host stack
+  // may still be touching runtime state, and keep the stragglers registered so
+  // a repeated attempt can observe them.
   {
     auto global_lock = global_critical_region_.Acquire();
     for (auto it = threads_by_id_.begin(); it != threads_by_id_.end();) {
-      if (!XThread::IsInThread(it->second) && it->second->is_guest_thread()) {
+      if (!XThread::IsInThread(it->second) && it->second->is_guest_thread() &&
+          !it->second->is_running() && it->second->host_exited() &&
+          std::find(drain.surviving_threads.begin(), drain.surviving_threads.end(), it->first) ==
+              drain.surviving_threads.end()) {
         it = threads_by_id_.erase(it);
       } else {
         ++it;
@@ -1027,9 +1057,15 @@ void KernelState::TerminateTitle() {
   }
 
   // Drop refs before the self-terminate below (which does not return) so they
-  // aren't leaked; reset the flag for relaunch.
+  // aren't leaked. Only clear the flag once every target has fully exited: a
+  // surviving thread still executes guest code, and CheckTitleTermination must
+  // keep asking it to self-exit on the next wait point. Clearing it while a
+  // straggler runs would both hide the blocked state from a repeated attempt
+  // and let that thread resume normal execution after teardown was requested.
   target_threads.clear();
-  terminating_title_.store(false, std::memory_order_release);
+  if (drain.clean()) {
+    terminating_title_.store(false, std::memory_order_release);
+  }
 
   // Self-terminate if called from a guest thread (e.g. XamLoaderTerminateTitle).
   if (XThread::IsInThread()) {
@@ -1039,6 +1075,8 @@ void KernelState::TerminateTitle() {
     }
     XThread::GetCurrentThread()->Terminate(0);
   }
+
+  return drain;
 }
 
 void KernelState::RegisterThread(XThread* thread) {

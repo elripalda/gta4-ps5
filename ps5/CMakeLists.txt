@@ -3,6 +3,19 @@
 cmake_minimum_required(VERSION 3.25)
 project(gta4-ps5 LANGUAGES C CXX)
 
+include(CheckCSourceCompiles)
+set(CMAKE_REQUIRED_LIBRARIES ps5platform)
+check_c_source_compiles("#include <ps5platform/shm.h>
+int main(void) {
+  struct ps5_shm shm = {0};
+  struct ps5_shm_unmap_report report = {0};
+  return ps5_shm_destroy_reported(&shm) + ps5_shm_unmap_reported(0, 0, 0, &report);
+}" F02_SDK_REPORTED_APIS_LINK)
+unset(CMAKE_REQUIRED_LIBRARIES)
+if(NOT F02_SDK_REPORTED_APIS_LINK)
+  message(FATAL_ERROR "The prepared SDK lifecycle APIs do not compile and link")
+endif()
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(BUILD_SHARED_LIBS OFF)

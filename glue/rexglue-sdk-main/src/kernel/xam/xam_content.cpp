@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <memory>
+
 #include <rex/cvar.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
@@ -28,6 +30,59 @@ namespace kernel {
 namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
+
+namespace {
+
+// Keeps a saved-game content operation visible to the save-completion barrier
+// for as long as it is in flight. The shared owner is captured by the deferred
+// callback, so the operation also stays visible while queued on the host
+// worker.
+//
+// Gated admission is used for transactions that may start new host work: it
+// fails once an authorized shutdown enters its commit phase. Unchecked
+// admission is for work that must proceed, such as closing content that is
+// already mounted.
+class SaveOperationScope {
+ public:
+  enum class Admission { kGated, kUnchecked };
+
+  SaveOperationScope(ContentManager* content_manager, Admission admission)
+      : content_manager_(content_manager) {
+    if (admission == Admission::kGated) {
+      acquired_ = content_manager_->TryBeginSaveOperation();
+    } else {
+      content_manager_->BeginSaveOperation();
+      acquired_ = true;
+    }
+  }
+  ~SaveOperationScope() {
+    if (acquired_) {
+      content_manager_->EndSaveOperation();
+    }
+  }
+
+  SaveOperationScope(const SaveOperationScope&) = delete;
+  SaveOperationScope& operator=(const SaveOperationScope&) = delete;
+
+  bool acquired() const { return acquired_; }
+
+ private:
+  ContentManager* content_manager_;
+  bool acquired_ = false;
+};
+
+// Completes an overlapped caller with a deterministic error and returns the
+// XAM convention for asynchronous completion.
+u32 RejectSaveOperation(mapped_void overlapped_ptr) {
+  if (overlapped_ptr) {
+    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(),
+                                                    X_ERROR_ACCESS_DENIED);
+    return X_ERROR_IO_PENDING;
+  }
+  return X_ERROR_ACCESS_DENIED;
+}
+
+}  // namespace
 
 u32 XamContentGetLicenseMask_entry(mapped_u32 mask_ptr, mapped_void overlapped_ptr) {
   // Each bit in the mask represents a granted license. Available licenses
@@ -127,13 +182,29 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
 
   auto content_manager = REX_KERNEL_STATE()->content_manager();
 
+  std::shared_ptr<SaveOperationScope> save_operation;
+  if (content_data.content_type == XContentType::kSavedGame) {
+    save_operation = std::make_shared<SaveOperationScope>(
+        content_manager, SaveOperationScope::Admission::kGated);
+    if (!save_operation->acquired()) {
+      // An authorized shutdown has entered its commit phase. Starting a new
+      // save here could outlive the wait for quiescence, so fail it clearly
+      // instead of admitting it.
+      if (overlapped_ptr && disposition_ptr) {
+        *disposition_ptr = 0;
+      }
+      return RejectSaveOperation(overlapped_ptr);
+    }
+  }
+
   if (overlapped_ptr && disposition_ptr) {
     *disposition_ptr = 0;
   }
 
   auto run = [content_manager, xuid, root_name = root_name.value(), flags, content_data,
-              disposition_ptr,
-              license_mask_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+              disposition_ptr, license_mask_ptr,
+              save_operation](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+    (void)save_operation;  // Owned for the operation's lifetime.
     X_RESULT result = X_ERROR_INVALID_PARAMETER;
     kDispositionState disposition = kDispositionState::Unknown;
     switch (flags & 0xF) {
@@ -358,6 +429,15 @@ u32 XamContentSetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
   uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
   XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_DATA*>();
 
+  std::shared_ptr<SaveOperationScope> save_operation;
+  if (content_data.content_type == XContentType::kSavedGame) {
+    save_operation = std::make_shared<SaveOperationScope>(
+        REX_KERNEL_STATE()->content_manager(), SaveOperationScope::Admission::kGated);
+    if (!save_operation->acquired()) {
+      return RejectSaveOperation(overlapped_ptr);
+    }
+  }
+
   // Buffer is PNG data.
   auto buffer = std::vector<uint8_t>((uint8_t*)buffer_ptr, (uint8_t*)buffer_ptr + buffer_size);
   auto result = REX_KERNEL_STATE()->content_manager()->SetContentThumbnail(xuid, content_data,
@@ -376,6 +456,15 @@ u32 XamContentDelete_entry(u32 user_index, mapped_void content_data_ptr,
   uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
   XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_DATA*>();
 
+  std::shared_ptr<SaveOperationScope> save_operation;
+  if (content_data.content_type == XContentType::kSavedGame) {
+    save_operation = std::make_shared<SaveOperationScope>(
+        REX_KERNEL_STATE()->content_manager(), SaveOperationScope::Admission::kGated);
+    if (!save_operation->acquired()) {
+      return RejectSaveOperation(overlapped_ptr);
+    }
+  }
+
   auto result = REX_KERNEL_STATE()->content_manager()->DeleteContent(xuid, content_data);
 
   if (overlapped_ptr) {
@@ -391,6 +480,15 @@ u32 XamContentDeleteInternal_entry(mapped_void content_data_ptr, mapped_void ove
   // 0xFE as user_index
   uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
   XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_AGGREGATE_DATA*>();
+
+  std::shared_ptr<SaveOperationScope> save_operation;
+  if (content_data.content_type == XContentType::kSavedGame) {
+    save_operation = std::make_shared<SaveOperationScope>(
+        REX_KERNEL_STATE()->content_manager(), SaveOperationScope::Admission::kGated);
+    if (!save_operation->acquired()) {
+      return RejectSaveOperation(overlapped_ptr);
+    }
+  }
 
   auto result = REX_KERNEL_STATE()->content_manager()->DeleteContent(xuid, content_data);
 

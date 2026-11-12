@@ -37,7 +37,10 @@ REXCVAR_DECLARE(std::string, ps5_frame_generation);
 #endif
 
 #include "achievement_bridge_gc.h"
+#include "gta4_episode_startup_policy.h"
 #include "gta4_frontend_hooks.h"
+#include "gta4_font_selection_trace.h"
+#include "gta4_quicksave_hooks.h"
 #include "gta4_presentation_options.h"
 #include "gta4_keyboard_controller.h"
 #include "gta4_touch_coordinator.h"
@@ -645,6 +648,9 @@ std::optional<rex::PathConfig> GTA4App::OnFinalizePaths(
     const rex::PathConfig& defaults, std::function<void(rex::PathConfig)> resume) {
 #if REX_PLATFORM_PS5
   // [ps5 port] The hub first; START GAME carries on with the start.
+  hub_defaults_ = defaults;
+  hub_defaults_valid_ = true;
+  gta4ps5::SetReturnToHubHandler([this] { RequestReturnToHub(); });
   gta4ps5::ShowHub(imgui_drawer(), immediate_drawer(), defaults, liberty_root_, native_config_path_,
                    [this, defaults, resume](void) {
                      if (auto paths = ContinueStartup(defaults, resume)) resume(std::move(*paths));
@@ -1082,7 +1088,8 @@ void StartLiveCvarWatcher(std::filesystem::path path) {
 
 void GTA4App::OnPostSetup() {
 #if REX_PLATFORM_PS5
-  gta4ps5::OnGameSetUp(imgui_drawer(), runtime(), user_data_root());
+  gta4ps5::OnGameSetUp(imgui_drawer(), runtime(), user_data_root(),
+                       [this](bool captured) { SetTitleInputCaptured(captured); });
 #endif
 #if REX_PLATFORM_ANDROID
   StartLiveCvarWatcher(rex::filesystem::GetUserFolder() / "live_cvars.txt");
@@ -1420,6 +1427,88 @@ void GTA4App::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
                             REXLOG_INFO("gta4-pc-input: action=text-chat-all key=Y");
                           }
                         });
+}
+
+void GTA4App::OnSessionEnding() {
+  REXLOG_INFO("F02: session ending for a return to the hub");
+  // The hub writes the next choice before it launches; a choice consumed by
+  // this session must not satisfy the next session's start.
+  gta4::episode_startup::Session().Reset();
+  REXLOG_INFO("F02: episode startup state reset for the next session");
+  OnShutdown();
+  gta4::frontend_menu::ResetSession();
+  gta4::quicksave::ResetSession();
+  GTA4_FontSelectionTraceResetSession();
+  REXLOG_INFO("F02: guest text and frontend ownership cleared after drain");
+}
+
+void GTA4App::OnPresentationTeardown() {
+#if REX_PLATFORM_PS5
+  // The in-game overlay and the hub's pictures belong to the drawer that is
+  // about to go; the rebuild makes new ones.
+  gta4ps5::OnGameTearDown();
+#endif
+}
+
+void GTA4App::RequestReturnToHub() {
+#if REX_PLATFORM_PS5
+  if (!hub_defaults_valid_) {
+    REXLOG_ERROR("F02: no hub launch defaults were captured; the return is refused");
+    gta4ps5::ResetReturnPrompt();
+    SetTitleInputCaptured(false);
+    return;
+  }
+  if (session_restart_in_progress()) {
+    REXLOG_WARN("F02: a return to the hub is already in progress");
+    return;
+  }
+  const uint32_t generation = session_generation();
+  REXLOG_INFO("F02: return to the hub confirmed (session {}); draining the guest", generation);
+  if (!RestartSessionForHub([this](bool succeeded) { OnSessionReturnFinished(succeeded); })) {
+    REXLOG_ERROR("F02: the session restart was refused; the game keeps running");
+    gta4ps5::ResetReturnPrompt();
+    SetTitleInputCaptured(false);
+  }
+#endif
+}
+
+void GTA4App::OnSessionReturnFinished(bool succeeded) {
+#if REX_PLATFORM_PS5
+  if (!succeeded) {
+    // The drain or the save barrier could not prove a safe stop, so nothing
+    // was destroyed and the title was already asked to terminate. It cannot be
+    // resumed safely; the overlay tells the player instead of pretending the
+    // session is playable again. (If the guest does finish exiting, the module
+    // thread's normal quit path ends the process.)
+    REXLOG_ERROR("F02: the return to the hub did not complete");
+    gta4ps5::ShowReturnFailure();
+    return;
+  }
+  REXLOG_INFO("F02: session ended cleanly; showing the hub (session {})", session_generation());
+  ShowHubForNextSession();
+#endif
+}
+
+void GTA4App::ShowHubForNextSession() {
+#if REX_PLATFORM_PS5
+  gta4ps5::ShowHub(imgui_drawer(), immediate_drawer(), hub_defaults_, liberty_root_, native_config_path_,
+                   [this] { StartSessionFromHub(); });
+#endif
+}
+
+void GTA4App::StartSessionFromHub() {
+#if REX_PLATFORM_PS5
+  auto resume = [this](rex::PathConfig paths) {
+    if (StartSessionAfterReturn(paths)) return;
+    REXLOG_ERROR("F02: the next session could not start; returning to the hub");
+    app_context().CallInUIThread([this] { ShowHubForNextSession(); });
+  };
+  if (auto paths = ContinueStartup(hub_defaults_, resume)) {
+    if (StartSessionAfterReturn(*paths)) return;
+    REXLOG_ERROR("F02: the next session could not start; returning to the hub");
+    app_context().CallInUIThread([this] { ShowHubForNextSession(); });
+  }
+#endif
 }
 
 bool GTA4App::RequiresSynchronizedInitialThreadResume() const {

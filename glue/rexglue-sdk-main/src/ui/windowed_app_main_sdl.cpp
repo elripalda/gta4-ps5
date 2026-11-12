@@ -467,7 +467,8 @@ static void Ps5DiagMonitor() {
     last_presents_seen = presents_now;
     const uint64_t now = NowMs();
     for (WaitSlot& w : wait_slots) {
-      if (!stuck_ticks) break;
+      RuntimeInspection inspection;
+      if (!inspection || !stuck_ticks) break;
       uint64_t since = w.since_ms.load(std::memory_order_acquire);
       if (since && since < now && now - since > 5000) {
         REXLOG_INFO("ps5 diag:   guest thread {:X} waiting {}s on {} {} handle {:08X}{} from game code {:08X}",

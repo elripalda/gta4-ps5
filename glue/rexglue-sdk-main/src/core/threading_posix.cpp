@@ -18,10 +18,12 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <array>
 #include <cerrno>
 #include <cstddef>
+#include <cstring>
 #include <ctime>
 #include <deque>
 #include <limits>
 #include <memory>
+#include <mutex>
 
 #include <pthread.h>
 #if REX_PLATFORM_ANDROID
@@ -369,7 +371,9 @@ class PosixConditionBase {
       }
     }
     if (executed) {
-      post_execution();
+      // A failed join is not a successful wait: the target's resources are
+      // still live, so the caller must not treat it as exited.
+      if (!post_execution()) return WaitResult::kFailed;
       return WaitResult::kSuccess;
     } else {
       return WaitResult::kTimeout;
@@ -446,17 +450,18 @@ class PosixConditionBase {
           }
         }
         if (all_signaled) {
+          bool posted = true;
           for (auto* handle : handles) {
-            handle->post_execution();
+            posted = handle->post_execution() && posted;
           }
-          return std::make_pair(WaitResult::kSuccess, size_t(0));
+          return std::make_pair(posted ? WaitResult::kSuccess : WaitResult::kFailed, size_t(0));
         }
       } else {
         for (size_t i = 0; i < handles.size(); ++i) {
           std::lock_guard<std::mutex> lock(handles[i]->mutex_);
           if (handles[i]->signaled()) {
-            handles[i]->post_execution();
-            return std::make_pair(WaitResult::kSuccess, i);
+            const bool posted = handles[i]->post_execution();
+            return std::make_pair(posted ? WaitResult::kSuccess : WaitResult::kFailed, i);
           }
         }
       }
@@ -499,7 +504,9 @@ class PosixConditionBase {
 
  protected:
   inline virtual bool signaled() const = 0;
-  inline virtual void post_execution() = 0;
+  // False when the wait could not finish the target's teardown (a failed
+  // pthread_join); every other waitable object returns true.
+  inline virtual bool post_execution() = 0;
   std::condition_variable cond_;
   std::mutex mutex_;
   std::vector<ExternalWaiter*> external_waiters_;  // guarded by mutex_
@@ -569,10 +576,11 @@ class PosixCondition<Event> : public PosixConditionBase {
 
  private:
   inline bool signaled() const override { return signal_; }
-  inline void post_execution() override {
+  inline bool post_execution() override {
     if (!manual_reset_) {
       signal_ = false;
     }
+    return true;
   }
   bool signal_;
   const bool manual_reset_;
@@ -602,10 +610,11 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
 
  private:
   inline bool signaled() const override { return count_ > 0; }
-  inline void post_execution() override {
+  inline bool post_execution() override {
     count_--;
     cond_.notify_all();
     NotifyExternalWaiters();
+    return true;
   }
   uint32_t count_;
   const uint32_t maximum_count_;
@@ -643,9 +652,10 @@ class PosixCondition<Mutant> : public PosixConditionBase {
   inline bool signaled() const override {
     return count_ == 0 || owner_ == std::this_thread::get_id();
   }
-  inline void post_execution() override {
+  inline bool post_execution() override {
     count_++;
     owner_ = std::this_thread::get_id();
+    return true;
   }
   uint32_t count_;
   std::thread::id owner_;
@@ -717,10 +727,11 @@ class PosixCondition<Timer> : public PosixConditionBase {
 
  private:
   inline bool signaled() const override { return signal_; }
-  inline void post_execution() override {
+  inline bool post_execution() override {
     if (!manual_reset_) {
       signal_ = false;
     }
+    return true;
   }
   std::weak_ptr<TimerQueueWaitItem> wait_item_;
   std::function<void()> callback_;
@@ -1157,19 +1168,27 @@ class PosixCondition<Thread> : public PosixConditionBase {
  private:
   static void* ThreadStartRoutine(void* parameter);
   inline bool signaled() const override { return signaled_; }
-  inline void post_execution() override {
-    if (thread_) {
-#if REX_PLATFORM_PS5
-      if (pthread_join(thread_, nullptr) == 0) {
-        Ps5StackFree(ps5_stack_);  // (the thread is gone: its stack can serve another)
-        ps5_stack_ = {};
-      }
-#else
-      pthread_join(thread_, nullptr);
-#endif
+  inline bool post_execution() override {
+    if (!thread_) return true;
+    std::lock_guard<std::mutex> lock(join_mutex_);
+    if (joined_) return true;
+    const int join_result = pthread_join(thread_, nullptr);
+    if (join_result != 0) {
+      // The target's stack and resources are still live; report the failure so
+      // the caller keeps its registration and does not call this exited.
+      REXSYS_ERROR("Thread join failed after exit: {}", std::strerror(join_result));
+      return false;
     }
+    joined_ = true;
+#if REX_PLATFORM_PS5
+    Ps5StackFree(ps5_stack_);
+    ps5_stack_ = {};
+#endif
     sem_destroy(&suspend_sem_);
+    return true;
   }
+  std::mutex join_mutex_;
+  bool joined_ = false;
   pthread_t thread_;
 #if REX_PLATFORM_PS5
   Ps5Stack ps5_stack_;

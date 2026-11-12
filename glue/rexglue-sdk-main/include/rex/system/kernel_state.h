@@ -27,6 +27,7 @@
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
 #include <rex/system/achievement_manager.h>
+#include <rex/system/cooperative_drain.h>
 #include <rex/system/thread_state.h>
 #include <rex/thread/fiber.h>
 #include <rex/system/util/native_list.h>
@@ -295,9 +296,15 @@ class KernelState {
     return object_ref<T>(reinterpret_cast<T*>(module.release()));
   }
 
-  // Terminates a title: Unloads all modules, and kills all guest threads.
-  // This DOES NOT RETURN if called from a guest thread!
-  void TerminateTitle();
+  // Terminates a title cooperatively: unloads modules and asks guest threads to
+  // exit, but never force-terminates one. The returned result distinguishes a
+  // clean drain from surviving threads. This DOES NOT RETURN if called from a
+  // guest thread.
+  // Requests cooperative guest-thread exit and waits up to timeout_ms for each
+  // target's host thread to finish releasing runtime references. Surviving
+  // threads are left running and stay registered; nothing is force-killed.
+  // Returns kClean only when every target has fully exited the host side.
+  DrainResult TerminateTitle(uint32_t timeout_ms = 200);
   bool is_terminating_title() const { return terminating_title_.load(std::memory_order_acquire); }
 
   void RegisterThread(XThread* thread);
@@ -376,7 +383,8 @@ class KernelState {
 
  private:
   void SignalAllWaitableObjects();
-  void WaitForThreadsToExit(const std::vector<object_ref<XThread>>& threads, uint32_t timeout_ms);
+  DrainResult WaitForThreadsToExit(const std::vector<object_ref<XThread>>& threads,
+                                   uint32_t timeout_ms);
   void LoadKernelModule(object_ref<KernelModule> kernel_module);
   void InitializeProcess(X_KPROCESS* process, uint32_t process_type, uint8_t unk_18, uint8_t unk_19,
                          uint8_t unk_1A);

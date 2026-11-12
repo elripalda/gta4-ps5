@@ -171,9 +171,14 @@ extern "C" void sub_82845600(PPCContext& ctx, uint8_t* base) {
 
   {
     std::lock_guard lock(gta4::g_motion_registration_mutex);
+    auto* runtime = rex::Runtime::instance();
+    auto* dispatcher = runtime ? runtime->function_dispatcher() : nullptr;
+    if (registration->thunk_address &&
+        (!dispatcher || dispatcher->GetFunction(registration->thunk_address) !=
+                            registration->replacement)) {
+      registration->thunk_address = 0;
+    }
     if (!registration->thunk_address) {
-      auto* runtime = rex::Runtime::instance();
-      auto* dispatcher = runtime ? runtime->function_dispatcher() : nullptr;
       registration->thunk_address =
           dispatcher ? dispatcher->AllocateThunk(registration->replacement, return_address) : 0;
       if (registration->thunk_address) {
@@ -183,7 +188,8 @@ extern "C" void sub_82845600(PPCContext& ctx, uint8_t* base) {
         REXLOG_ERROR("gta4-motion: failed to allocate thunk for {}", registration->name);
       }
     }
-    if (registration->thunk_address) {
+    if (registration->thunk_address && dispatcher &&
+        dispatcher->GetFunction(registration->thunk_address) == registration->replacement) {
       ctx.r4.u32 = registration->thunk_address;
     }
   }

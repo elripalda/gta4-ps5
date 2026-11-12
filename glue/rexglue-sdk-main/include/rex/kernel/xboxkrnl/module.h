@@ -24,6 +24,8 @@
 
 namespace rex::kernel::xboxkrnl {
 
+class VdHsioLockWatcher;
+
 class XboxkrnlModule : public system::KernelModule {
  public:
   XboxkrnlModule(Runtime* emulator, system::KernelState* kernel_state);
@@ -39,6 +41,9 @@ class XboxkrnlModule : public system::KernelModule {
   uint32_t pix_function_ = 0;
 
  private:
+  // Owns the VdHSIOCalibrationLock diagnostic worker. It reads guest memory and
+  // must be stopped while the session's memory views are still mapped.
+  std::unique_ptr<VdHsioLockWatcher> hsio_watch_;
   std::unique_ptr<rex::thread::HighResolutionTimer> timestamp_timer_;
 };
 

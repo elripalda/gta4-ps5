@@ -211,6 +211,8 @@ if(REXGLUE_USE_VULKAN)
         "Directory containing a DXC shared library compatible with gta4-native shader overrides")
     set(GTA4_NATIVE_SHADER_COMMON
         "${GTA4_NATIVE_SHADER_OVERRIDE_ROOT}/xenos_shader_common.h")
+    set(GTA4_NATIVE_DXC "" CACHE FILEPATH "Host DXC executable for shader overrides")
+    if(NOT GTA4_NATIVE_DXC)
     if(CMAKE_HOST_WIN32)
         # The bundled DXC 1.8 crashes on the Bink pixel shaders here as well
         # (see the macOS branch). GTA4_NATIVE_DXC_LIBRARY_PATH may name the bin
@@ -246,6 +248,8 @@ if(REXGLUE_USE_VULKAN)
         if(NOT GTA4_NATIVE_DXC_LIBRARY_PATH)
             set(GTA4_NATIVE_DXC_LIBRARY_PATH "${GTA4_NATIVE_DXC_ROOT}/lib/x64")
         endif()
+    endif()
+
     endif()
 
     set(GTA4_NATIVE_SHADER_OVERRIDE_COMMAND

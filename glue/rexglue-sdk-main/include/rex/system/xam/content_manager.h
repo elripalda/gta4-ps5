@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -22,9 +23,14 @@
 #include <rex/memory.h>
 #include <rex/string/key.h>
 #include <rex/string.h>
+#include <rex/system/save_completion.h>
 #include <rex/system/xcontent.h>
 #include <rex/system/xtypes.h>
 #include <rex/thread/mutex.h>
+
+namespace rex::filesystem {
+class WriteActivityTracker;
+}  // namespace rex::filesystem
 
 namespace rex {
 namespace system {
@@ -137,6 +143,11 @@ class ContentPackage {
 
   uint32_t GetPackageLicense() const { return license_; }
 
+  // Non-null only for saved-game packages.
+  std::shared_ptr<rex::filesystem::WriteActivityTracker> write_tracker() const {
+    return write_tracker_;
+  }
+
  private:
   KernelState* kernel_state_;
   std::string root_name_;
@@ -144,6 +155,7 @@ class ContentPackage {
   std::filesystem::path package_path_;
   XCONTENT_AGGREGATE_DATA content_data_;
   uint32_t license_ = 0;
+  std::shared_ptr<rex::filesystem::WriteActivityTracker> write_tracker_;
 };
 
 class ContentManager {
@@ -202,6 +214,32 @@ class ContentManager {
   // supplied, packages are installed directly beneath it.
   X_RESULT InstallContent(const std::filesystem::path& package_path);
 
+  // Save-completion barrier state. A save is pending while a saved-game
+  // content operation is executing or a write handle on a save-backed mount is
+  // open. WaitForSaveCompletion reports a timeout as incomplete, never clean.
+  SaveActivitySnapshot SnapshotSaveActivity();
+  SaveWaitResult WaitForSaveCompletion(std::chrono::milliseconds timeout);
+
+  // Commit-phase admission gate for saved-game content operations. Once
+  // EnterSaveCommitPhase has returned, TryBeginSaveOperation always fails and
+  // an operation admitted earlier remains counted until EndSaveOperation.
+  bool TryBeginSaveOperation();
+  void BeginSaveOperation();
+  void EndSaveOperation();
+  void EnterSaveCommitPhase();
+  bool save_commit_phase() const;
+
+  // Succeeds only when admission is closed, no save operation is executing,
+  // no write handle is open, and no save content root is mounted. A timeout
+  // reports the last snapshot and never claims success.
+  SaveWaitResult WaitForSaveQuiescence(std::chrono::milliseconds timeout);
+
+  // Closes every mounted saved-game content root, releasing and flushing its
+  // remaining write handles. The caller must already have proven that no guest
+  // thread can issue I/O (a clean cooperative drain); this is host teardown,
+  // not an operation the guest requested. Returns the number of roots closed.
+  uint32_t CloseMountedSaveContents();
+
  private:
   std::filesystem::path ResolvePackageRoot(uint64_t xuid, XContentType content_type,
                                            uint32_t title_id = -1);
@@ -228,6 +266,10 @@ class ContentManager {
   rex::thread::global_critical_region global_critical_region_;
   std::unordered_map<string::string_key_case, ContentPackage*, string::string_key_case::Hash>
       open_packages_;
+  // Saved-game content operations currently executing (including deferred
+  // calls queued for the host worker) and the admission gate that rejects new
+  // ones once shutdown enters its commit phase.
+  SaveQuiescenceGate save_gate_;
 };
 
 }  // namespace xam

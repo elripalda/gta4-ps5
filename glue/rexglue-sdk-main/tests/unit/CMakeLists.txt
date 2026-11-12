@@ -15,6 +15,17 @@ add_executable(unit_tests
     core/diagnostics_policy_test.cpp
     core/fiber_test.cpp
     core/gta4_transition_test.cpp
+    system/f02_return_to_hub_test.cpp
+    system/f02_cooperative_drain_test.cpp
+    system/f02_save_completion_test.cpp
+    system/f02_save_quiescence_test.cpp
+    system/f02_cooperative_shutdown_test.cpp
+    system/f02_return_prompt_test.cpp
+    system/f02_relaunch_policy_test.cpp
+    system/f02_session_restart_test.cpp
+    system/f02_game_menu_test.cpp
+    system/f02_episode_startup_test.cpp
+    system/f02_hsio_watch_test.cpp
     core/gpu_flight_recorder_test.cpp
     core/sha256_test.cpp
     core/stream_test.cpp
@@ -393,6 +404,33 @@ catch_discover_tests(arbitration_async_tests
 )
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+if(UNIX AND NOT REX_PLATFORM_PS5 AND NOT CMAKE_CROSSCOMPILING)
+    add_executable(f02_keybind_reregistration_tests
+        system/f02_keybind_reregistration_test.cpp
+        ${PROJECT_SOURCE_DIR}/src/ui/keybinds.cpp)
+    target_compile_definitions(f02_keybind_reregistration_tests PRIVATE GTA4_F02_STANDALONE)
+    target_include_directories(f02_keybind_reregistration_tests BEFORE PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/system/f02_keybind_stubs
+        ${PROJECT_SOURCE_DIR}/include)
+    add_test(NAME unit.f02-keybind-reregistration COMMAND f02_keybind_reregistration_tests)
+    foreach(suite native_confirmation native_teardown native_graphics_cache text_lifetime runtime_inspection)
+        set(extra)
+        if(suite STREQUAL "native_confirmation")
+            list(APPEND extra --simde ${PROJECT_SOURCE_DIR}/thirdparty/simde)
+        endif()
+        add_test(NAME unit.f02-${suite} COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/system/f02_${suite}_test.py
+            --root ${PROJECT_SOURCE_DIR} --cxx ${CMAKE_CXX_COMPILER} ${extra})
+        set_tests_properties(unit.f02-${suite} PROPERTIES LABELS "unit;f02" TIMEOUT 240)
+    endforeach()
+    add_test(NAME unit.f02-watcher-lifetime COMMAND ${Python3_EXECUTABLE} -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/system/f02_watcher_lifetime_audit_test.py --root ${PROJECT_SOURCE_DIR})
+    add_test(NAME unit.f02-motion-registration COMMAND ${Python3_EXECUTABLE} -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/system/gta4_motion_registration_test.py
+        --root ${PROJECT_SOURCE_DIR} --cxx ${CMAKE_CXX_COMPILER}
+        --simde ${PROJECT_SOURCE_DIR}/thirdparty/simde)
+    set_tests_properties(unit.f02-motion-registration PROPERTIES LABELS "unit;f02" TIMEOUT 240)
+endif()
 add_test(NAME unit.sony-controller-runtime
     COMMAND ${Python3_EXECUTABLE}
         ${PROJECT_SOURCE_DIR}/tools/run_sony_feedback_tests.py

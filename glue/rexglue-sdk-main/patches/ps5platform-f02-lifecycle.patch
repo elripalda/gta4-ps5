@@ -1,0 +1,80 @@
+--- a/platform/include/ps5platform/shm.h
++++ b/platform/include/ps5platform/shm.h
+@@ -53,3 +53,18 @@
++/* [F02 diagnostic] The steps ps5_shm_unmap performs, reported separately, so a
++ * caller can tell a failed unmap from a failed re-reservation. Behaviour and
++ * accounting are those of ps5_shm_unmap. */
++struct ps5_shm_unmap_report {
++   int unmap_result;      /* sceKernelMunmap's result */
++   int reserve_result;    /* 0 when no reservation was requested */
++   void *reserve_address; /* the address the re-reservation returned */
++   unsigned reserved;     /* non-zero: a re-reservation was requested */
++};
++int ps5_shm_unmap_reported(void *view, size_t bytes, unsigned flags,
++                           struct ps5_shm_unmap_report *report);
++
++/* Failed release retains the descriptor and live counters; an empty descriptor is a no-op. */
++int ps5_shm_destroy_reported(struct ps5_shm *shm);
++
+ /* A reserved range: address space nothing else is given, outside the GPU
+  * window, at the hint when it is free. */
+ int ps5_vrange_reserve(size_t bytes, void *hint, size_t alignment, void **base);
+--- a/platform/src/shm.c
++++ b/platform/src/shm.c
+@@ -128,4 +128,56 @@
+ int
++ps5_shm_unmap_reported(void *view, size_t bytes, unsigned flags, struct ps5_shm_unmap_report *report)
++{
++   if (!report)
++      return PS5_SHM_BAD_REQUEST;
++   memset(report, 0, sizeof(*report));
++   report->unmap_result = PS5_SHM_BAD_REQUEST;
++   if (!view || bytes == 0)
++      return PS5_SHM_BAD_REQUEST;
++   const int32_t unmapped = sceKernelMunmap(view, bytes);
++   if (report)
++      report->unmap_result = unmapped;
++   if (unmapped != 0)
++      return unmapped;
++   atomic_fetch_sub(&views, 1);
++   atomic_fetch_sub(&view_bytes, bytes);
++   if (flags & PS5_SHM_KEEP_RESERVED) {
++      void *at = view;
++      const int32_t reserved = sceKernelReserveVirtualRange(&at, bytes, PS5_KERNEL_MAP_FIXED,
++                                                            PS5P_PAGE);
++      if (report) {
++         report->reserved = 1;
++         report->reserve_result = reserved;
++         report->reserve_address = at;
++      }
++      if (reserved == 0 && at != view) {
++         sceKernelMunmap(at, bytes);
++         if (report)
++            report->reserve_result = PS5_SHM_NO_PLACE;
++         return PS5_SHM_NO_PLACE;
++      }
++      return reserved;
++   }
++   return 0;
++}
++
++int
++ps5_shm_destroy_reported(struct ps5_shm *shm)
++{
++   if (!shm)
++      return PS5_SHM_BAD_REQUEST;
++   if (shm->bytes == 0)
++      return 0;
++   const int32_t result = sceKernelReleaseDirectMemory(shm->direct_start, shm->bytes);
++   if (result != 0)
++      return result;
++   atomic_fetch_sub(&objects, 1);
++   atomic_fetch_sub(&object_bytes, shm->bytes);
++   memset(shm, 0, sizeof(*shm));
++   return 0;
++}
++
++int
+ ps5_vrange_reserve(size_t bytes, void *hint, size_t alignment, void **base)
+ {
+    if (base)

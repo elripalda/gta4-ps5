@@ -11,9 +11,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <queue>
 #include <string>
+#include <thread>
 #include <unordered_set>
 
 #include <fmt/format.h>
@@ -21,6 +23,7 @@
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/stfs_container_device.h>
+#include <rex/filesystem/write_activity_tracker.h>
 #include <rex/logging.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
@@ -49,10 +52,15 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
   content_data_ = data;
 
   auto fs = kernel_state_->file_system();
-  const bool trace_io = data.content_type == XContentType::kSavedGame;
-  auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false,
-                                                                  /*allow_share_delete=*/true,
-                                                                  trace_io);
+  const bool is_saved_game = data.content_type == XContentType::kSavedGame;
+  const bool trace_io = is_saved_game;
+  auto device = std::make_unique<rex::filesystem::HostPathDevice>(
+      device_path_, package_path, false,
+      /*allow_share_delete=*/true, trace_io,
+      /*save_data=*/is_saved_game);
+  if (is_saved_game) {
+    write_tracker_ = device->write_tracker();
+  }
   device->Initialize();
   fs->RegisterDevice(std::move(device));
   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
@@ -710,6 +718,104 @@ void ContentManager::CloseOpenedFilesFromContent(const std::string_view root_nam
       file->ReleaseHandle();
     }
   }
+}
+
+SaveActivitySnapshot ContentManager::SnapshotSaveActivity() {
+  SaveActivitySnapshot snapshot;
+  // Read the admission state first. If it is closed, EnterCommitPhase has
+  // returned, so no new operation can start and the pending count is stable.
+  // If it is open, quiescent() is false regardless of the count.
+  snapshot.save_admission_closed = save_gate_.commit_phase();
+  snapshot.pending_save_operations = save_gate_.pending();
+
+  std::vector<std::string> files;
+  std::vector<std::string> roots;
+  {
+    // Hold the lock so open packages cannot be detached while their trackers
+    // are read. CloseContent detaches under this same lock after releasing the
+    // content's file handles, so a mounted save root is either fully visible
+    // here or already closed and flushed. Tracker locking is independent and
+    // never takes this lock.
+    auto global_lock = global_critical_region_.Acquire();
+    for (const auto& [key, package] : open_packages_) {
+      if (package->GetPackageContentData().content_type != XContentType::kSavedGame) {
+        continue;
+      }
+      ++snapshot.open_save_contents;
+      roots.emplace_back(key.view());
+      auto tracker = package->write_tracker();
+      if (!tracker) {
+        continue;
+      }
+      const auto tracker_state = tracker->SnapshotState();
+      snapshot.open_write_handles += tracker_state.open_handles;
+      files.insert(files.end(), tracker_state.paths.begin(), tracker_state.paths.end());
+    }
+  }
+
+  std::sort(files.begin(), files.end());
+  files.erase(std::unique(files.begin(), files.end()), files.end());
+  snapshot.pending_files = std::move(files);
+
+  std::sort(roots.begin(), roots.end());
+  roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
+  snapshot.open_content_roots = std::move(roots);
+  return snapshot;
+}
+
+SaveWaitResult ContentManager::WaitForSaveCompletion(std::chrono::milliseconds timeout) {
+  return ::rex::system::WaitForSaveCompletion(
+      [this]() { return SnapshotSaveActivity(); }, timeout,
+      []() { return std::chrono::steady_clock::now(); },
+      [](std::chrono::milliseconds duration) { std::this_thread::sleep_for(duration); });
+}
+
+SaveWaitResult ContentManager::WaitForSaveQuiescence(std::chrono::milliseconds timeout) {
+  return ::rex::system::WaitForSaveQuiescence(
+      [this]() { return SnapshotSaveActivity(); }, timeout,
+      []() { return std::chrono::steady_clock::now(); },
+      [](std::chrono::milliseconds duration) { std::this_thread::sleep_for(duration); });
+}
+
+uint32_t ContentManager::CloseMountedSaveContents() {
+  std::vector<std::string> roots;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    roots.reserve(open_packages_.size());
+    for (const auto& [key, package] : open_packages_) {
+      if (package->GetPackageContentData().content_type == XContentType::kSavedGame) {
+        roots.emplace_back(key.view());
+      }
+    }
+  }
+
+  uint32_t closed = 0;
+  for (const auto& root : roots) {
+    if (CloseContent(root) == X_ERROR_SUCCESS) {
+      ++closed;
+    }
+  }
+  return closed;
+}
+
+bool ContentManager::TryBeginSaveOperation() {
+  return save_gate_.TryBegin();
+}
+
+void ContentManager::BeginSaveOperation() {
+  save_gate_.Begin();
+}
+
+void ContentManager::EndSaveOperation() {
+  save_gate_.End();
+}
+
+void ContentManager::EnterSaveCommitPhase() {
+  save_gate_.EnterCommitPhase();
+}
+
+bool ContentManager::save_commit_phase() const {
+  return save_gate_.commit_phase();
 }
 
 static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,

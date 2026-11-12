@@ -20,6 +20,7 @@
 #include "game/trophies_game.h"
 #include "hub/hub_lang.h"
 #include "hub/ps5_hub.h"
+#include "lifecycle/f02_menu_request.h"
 
 // The hub's Language (Game page): auto (the PS5's), english, french, german,
 // spanish or italian. The game is told it as the Xbox 360's language and
@@ -37,6 +38,7 @@ namespace {
 const fs::path kApp("/app0");
 fs::path g_saves_root;
 std::unique_ptr<GameOverlay> g_overlay;
+std::function<void()> g_return_to_hub;
 }  // namespace
 
 void ShowHub(rex::ui::ImGuiDrawer* drawer, rex::ui::ImmediateDrawer* immediate, const rex::PathConfig& paths,
@@ -88,11 +90,41 @@ void ShowHub(rex::ui::ImGuiDrawer* drawer, rex::ui::ImmediateDrawer* immediate, 
   });
 }
 
-void OnGameSetUp(rex::ui::ImGuiDrawer* drawer, rex::Runtime* runtime, const fs::path& user_data) {
+void OnGameSetUp(rex::ui::ImGuiDrawer* drawer, rex::Runtime* runtime, const fs::path& user_data,
+                 std::function<void(bool)> set_title_input_captured) {
   WriteTrophyCatalog(runtime, user_data);
   // (the game's PS5 trophy set and pop-ups, on a thread of its own)
   StartNativeTrophies(runtime, user_data);
-  g_overlay = std::make_unique<GameOverlay>(drawer);
+  // A new session starts with nothing latched: the previous confirmation (if
+  // any) is gone with the frontend it belonged to.
+  gta4::ps5::lifecycle::f02::RequestConfirmationReset();
+  g_overlay = std::make_unique<GameOverlay>(drawer, g_return_to_hub,
+                                            std::move(set_title_input_captured));
+}
+
+void SetReturnToHubHandler(std::function<void()> handler) {
+  g_return_to_hub = std::move(handler);
+}
+
+void OnGameTearDown() {
+  // The dialog goes before the drawer; the pictures go before the immediate
+  // drawer that made them.
+  g_overlay.reset();
+  hub::ResetTextures();
+}
+
+void ResetReturnPrompt() {
+  if (g_overlay) g_overlay->ResetReturnPrompt();
+}
+
+void ShowReturnFailure() {
+  if (g_overlay) {
+    g_overlay->ShowReturnFailure();
+  } else {
+    // The overlay was already released with the presentation; there is nothing
+    // left to tell the player through.
+    REXLOG_ERROR("F02: the return failed after the presentation was released");
+  }
 }
 
 }  // namespace gta4ps5

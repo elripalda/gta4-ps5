@@ -26,10 +26,18 @@ applies the PS5's patches to FFmpeg and libmspack.
 ## 2. Build
 
 ```
-SDK=~/ps5-plume-triangle/.deps/native/ps5-payload-sdk
+git clone https://github.com/mihawk-99/PS5_PayloadSDK.git /path/to/f02-sdk-source
+git -C /path/to/f02-sdk-source checkout 95c08f27386fc698f6bbe21dde3030140a41d10b
+python3 ps5/tools/prepare_f02_sdk.py --source /path/to/f02-sdk-source \
+  --base-sdk ~/ps5-plume-triangle/.deps/native/ps5-payload-sdk \
+  --output /path/to/fresh-f02-sdk
+export LLVM_CONFIG=$(command -v llvm-config-19)
+export PS5_PAYLOAD_SDK=/path/to/fresh-f02-sdk
+SDK=$PS5_PAYLOAD_SDK
 DXC=/path/to/dxc
 cmake -S ps5 -B out/ps5 -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_TOOLCHAIN_FILE=$PWD/ps5/cmake/ps5-toolchain.cmake -DPS5_PAYLOAD_SDK=$SDK \
+  -DPS5_ZLIB_ROOT=~/ps5-plume-triangle/.deps/native/zlib/root/usr \
   -DGTA4_NATIVE_DXC=$DXC/bin/dxc -DGTA4_NATIVE_DXC_LIBRARY_PATH=$DXC/lib \
   -DREXGLUE_ENABLE_TRACY=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
   -DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_KMSDRM=OFF -DSDL_OPENGL=OFF -DSDL_OPENGLES=OFF \
@@ -44,6 +52,13 @@ ninja -C out/ps5 gta4
 ps5/tools/ps5_package.sh out/ps5 ~/ps5-plume-triangle
 ```
 
+The SDK preparation copies the existing toolchain/runtime into a fresh directory,
+archives pristine SDK source at the pin, applies the tracked lifecycle patch, and
+rebuilds `libps5platform.a` and its headers. Configure and packaging verify the
+source/header/archive hashes in its receipt; an old patched SDK is not accepted.
+The base SDK and its source checkout are never edited. Optional `--cc`, `--ar`,
+`--nm` and `--llvm-config` arguments select an already installed LLVM toolchain.
+
 The app ends up in `out/ps5/ps5-app/PPSA94004`. Copy it to `/data/homebrew/` on the PS5.
 
 The FidelityFX lines add FSR 3 (the hub's Frame Generation option). They need Wine
@@ -56,6 +71,21 @@ Its licence doesn't allow sharing it, so it isn't in this repo: put your own
 `HelveticaNeue-Heavy.ttf` in `ps5/assets/fonts/` before building, or the tabs
 use the hub's usual type.
 
+
+## Host lifecycle gates
+
+```
+python3 ps5/tools/run_f02_host_gates.py --out /path/to/new-results \
+  --sdk-source "$PS5_PAYLOAD_SDK/_f02_source"
+cmake -S ps5/tests -B out/f02-host -G Ninja \
+  -DF02_SDK_SOURCE="$PS5_PAYLOAD_SDK/_f02_source"
+cmake --build out/f02-host
+ctest --test-dir out/f02-host --output-on-failure
+```
+
+The matrix runs GCC and Clang, plain and ASan/UBSan, against the current source.
+These gates do not establish PS5 gameplay acceptance. An extracted integration
+is different from earlier tested executables and needs its own gameplay evidence.
 
 ## On the PS5
 
