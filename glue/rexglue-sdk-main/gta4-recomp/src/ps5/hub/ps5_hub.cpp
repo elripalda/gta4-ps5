@@ -456,6 +456,18 @@ void Show(rex::ui::ImGuiDrawer* drawer, rex::ui::ImmediateDrawer* immediate, con
   new HubDialog(drawer, immediate, paths, std::move(launch));  // (the dialog owns itself)
 }
 
+void ResetTextures() {
+  g_textures->clear();
+  // The ids in g_assets pointed into the textures just freed. Drop them so a
+  // later Show that cannot reload a picture draws nothing instead of a stale
+  // texture handle.
+  g_assets.grunge = {};
+  g_assets.logo = {};
+  g_assets.hero = {};
+  for (auto& home : g_assets.home) home = Assets::HomeArt{};
+  g_assets.buttons.clear();
+}
+
 }  // namespace gta4ps5::hub
 
 #endif  // __PROSPERO__

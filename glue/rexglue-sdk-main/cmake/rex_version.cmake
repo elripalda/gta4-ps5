@@ -107,6 +107,25 @@ function(rex_resolve_version out_var)
     endif()
 
     execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse --show-toplevel
+        WORKING_DIRECTORY "${ARG_SOURCE_DIR}"
+        OUTPUT_VARIABLE git_root
+        ERROR_QUIET
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+    file(REAL_PATH "${ARG_SOURCE_DIR}" version_source)
+    # A vendored SDK must not inherit its consumer's release tags.
+    if(NOT git_root STREQUAL version_source)
+        rex_compute_version(result
+            FLOOR_MAJOR ${ARG_FLOOR_MAJOR}
+            FLOOR_MINOR ${ARG_FLOOR_MINOR}
+            GIT_DESCRIBE_LONG ""
+            GIT_DESCRIBE_EXACT ""
+            BRANCH_NAME "")
+        set(${out_var} "${result}" PARENT_SCOPE)
+        return()
+    endif()
+
+    execute_process(
         COMMAND ${GIT_EXECUTABLE} describe --tags --exact-match
             --match "v[0-9]*.[0-9]*.[0-9]*"
             --exclude "*-*"

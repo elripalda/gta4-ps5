@@ -11,9 +11,11 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 
 #include <rex/filesystem/device.h>
+#include <rex/filesystem/write_activity_tracker.h>
 
 namespace rex::filesystem {
 
@@ -21,8 +23,11 @@ class HostPathEntry;
 
 class HostPathDevice : public Device {
  public:
+  // save_data enables write-activity tracking for this mount so the F02
+  // save-completion barrier can observe open save-file writes.
   HostPathDevice(const std::string_view mount_path, const std::filesystem::path& host_path,
-                 bool read_only, bool allow_share_delete = false, bool trace_io = false);
+                 bool read_only, bool allow_share_delete = false, bool trace_io = false,
+                 bool save_data = false);
   ~HostPathDevice() override;
 
   bool Initialize() override;
@@ -36,6 +41,9 @@ class HostPathDevice : public Device {
   // and read-only devices leave it off (see a5c3a963 ghost-file fix).
   bool allow_share_delete() const { return allow_share_delete_; }
   bool trace_io() const { return trace_io_; }
+  bool save_data() const { return save_data_; }
+  // Non-null only when save_data is set.
+  std::shared_ptr<WriteActivityTracker> write_tracker() const { return write_tracker_; }
   const std::filesystem::path& host_path() const { return host_path_; }
 
   const std::string& name() const override { return name_; }
@@ -56,6 +64,10 @@ class HostPathDevice : public Device {
   bool read_only_;
   bool allow_share_delete_;
   bool trace_io_;
+  bool save_data_;
+  // Shared so an open write handle keeps the tracker alive even if the device
+  // is torn down first.
+  std::shared_ptr<WriteActivityTracker> write_tracker_;
 };
 
 }  // namespace rex::filesystem

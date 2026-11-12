@@ -9,6 +9,8 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <atomic>
+
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/diagnostics/gta4_transition.h>
@@ -21,6 +23,10 @@
 #include <rex/platform/exceptions.h>  // SEH exception support
 #include <rex/kernel/crt/heap.h>
 #include <rex/runtime.h>
+#if REX_PLATFORM_PS5
+#include <rex/ps5_diag.h>
+#endif
+#include <rex/system/cooperative_shutdown.h>
 #include <rex/system/export_resolver.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/function_dispatcher.h>
@@ -44,6 +50,19 @@ Runtime* Runtime::instance_ = nullptr;
 
 Runtime* Runtime::instance() {
   return instance_;
+}
+
+namespace {
+
+// Incremented whenever a graphics system is installed or destroyed. Guests
+// cache the graphic system pointer for the session they first saw; the stamp
+// lets them tell that the session changed without re-resolving every call.
+std::atomic<uint64_t> g_graphics_generation{0};
+
+}  // namespace
+
+uint64_t Runtime::graphics_generation() {
+  return g_graphics_generation.load(std::memory_order_acquire);
 }
 
 Runtime::Runtime(const std::filesystem::path& game_data_root,
@@ -96,8 +115,8 @@ std::optional<EmbeddedMetadataAsset> Runtime::FindEmbeddedMetadata(
 }
 
 X_STATUS Runtime::Setup(RuntimeConfig config) {
-  if (instance_ != nullptr) {
-    REXSYS_ERROR("Runtime::Setup() called but global instance already exists");
+  if (instance_ != nullptr || memory_ || !last_shutdown_released_everything_) {
+    REXSYS_ERROR("Runtime::Setup() refused: an existing runtime still owns resources");
     return X_STATUS_UNSUCCESSFUL;
   }
   instance_ = this;
@@ -194,6 +213,7 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   // Initialize GPU from injected config
   if (config.graphics) {
     graphics_system_ = std::move(config.graphics);
+    g_graphics_generation.fetch_add(1, std::memory_order_release);
     bool with_presentation = (app_context_ != nullptr);
     X_STATUS gpu_status = graphics_system_->Setup(function_dispatcher_.get(), kernel_state_.get(),
                                                   app_context_, with_presentation);
@@ -264,15 +284,19 @@ void Runtime::Shutdown() {
     return;
   }
 
-  if (instance_ == this) {
-    instance_ = nullptr;
-  }
+#if REX_PLATFORM_PS5
+  struct SamplingPause {
+    SamplingPause() { rex::ps5diag::SuspendStackSampling(); }
+    ~SamplingPause() { rex::ps5diag::ResumeStackSampling(); }
+  } sampling_pause;
+#endif
 
   diagnostics::gta4_transition::Shutdown();
 
   if (graphics_system_) {
     graphics_system_->Shutdown();
     graphics_system_.reset();
+    g_graphics_generation.fetch_add(1, std::memory_order_release);
   }
   if (audio_system_) {
     audio_system_->Shutdown();
@@ -286,10 +310,90 @@ void Runtime::Shutdown() {
   function_dispatcher_.reset();
   export_resolver_.reset();
   file_system_.reset();
+#if REX_PLATFORM_PS5
+  last_shutdown_released_everything_ = !memory_ || memory_->ReleaseGuestMappings();
+  if (!last_shutdown_released_everything_) {
+    setup_complete_ = false;
+    REXSYS_ERROR("Runtime retains the guest memory owner after incomplete release");
+    rex::FlushLogging();
+    return;
+  }
+#endif
   memory_.reset();
-
+  if (instance_ == this) {
+    instance_ = nullptr;
+  }
   rex::perf::Profiler::Shutdown();
   setup_complete_ = false;
+}
+
+system::ShutdownReport Runtime::ShutdownCooperatively(
+    uint32_t guest_timeout_ms, std::chrono::milliseconds save_timeout,
+    std::function<void()> before_shutdown) {
+  system::ShutdownReport report;
+
+  if (!kernel_state_) {
+    if (memory_) Shutdown();
+    report.status = last_shutdown_released_everything_
+                        ? system::ShutdownStatus::kComplete
+                        : system::ShutdownStatus::kReleasedIncomplete;
+    return report;
+  }
+
+  // Destroying the runtime from a guest thread would unmap the memory and
+  // objects that this very thread is executing on. Refuse and report blocked
+  // so the caller can retry from a host thread.
+  if (system::XThread::IsInThread()) {
+    REXSYS_ERROR("Runtime::ShutdownCooperatively refused: called from a guest thread");
+    report.status = system::ShutdownStatus::kBlockedOnGuestThreads;
+    return report;
+  }
+
+  // Shutdown is committed from this point on: no new saved-game operation is
+  // admitted, even while the drain runs. A rejected save reaches the guest as
+  // a failed operation, which is the correct outcome while the title exits.
+  // The gate is deliberately not reopened on a blocked result; the caller must
+  // either retry or abandon the transition, never resume gameplay halfway.
+  auto* content_manager = kernel_state_->content_manager();
+  if (content_manager) {
+    content_manager->EnterSaveCommitPhase();
+  }
+
+  REXSYS_INFO("Runtime::ShutdownCooperatively: draining guest threads ({} ms)",
+              guest_timeout_ms);
+
+#if REX_PLATFORM_PS5
+  struct SamplingPause {
+    SamplingPause() { rex::ps5diag::SuspendStackSampling(); }
+    ~SamplingPause() { rex::ps5diag::ResumeStackSampling(); }
+  } sampling_pause;
+#endif
+
+  report = system::RunCooperativeShutdown(
+      [this, guest_timeout_ms] { return kernel_state_->TerminateTitle(guest_timeout_ms); },
+      [content_manager] {
+        if (content_manager) {
+          content_manager->CloseMountedSaveContents();
+        }
+      },
+      [content_manager, save_timeout]() -> system::SaveWaitResult {
+        if (!content_manager) {
+          system::SaveWaitResult done;
+          done.clean = true;
+          return done;
+        }
+        return content_manager->WaitForSaveQuiescence(save_timeout);
+      },
+      [this, before_shutdown = std::move(before_shutdown)]() -> bool {
+        if (before_shutdown) {
+          before_shutdown();
+        }
+        Shutdown();
+        return last_shutdown_released_everything_;
+      });
+
+  REXSYS_INFO("Runtime::ShutdownCooperatively: status={}", static_cast<int>(report.status));
+  return report;
 }
 
 uint8_t* Runtime::virtual_membase() const {

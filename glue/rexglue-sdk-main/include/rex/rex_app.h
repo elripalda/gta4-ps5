@@ -114,6 +114,18 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Called before cleanup begins. Release custom resources here.
   virtual void OnShutdown() {}
 
+  /// Called on the UI thread when an in-process return to the hub ends the
+  /// current title session. The default runs OnShutdown() so existing titles
+  /// need no change. Unlike OnShutdown this may run once per session over the
+  /// app's life; overrides must therefore be safe to call again.
+  virtual void OnSessionEnding() { OnShutdown(); }
+
+  /// Called on the UI thread after the last title dialog was released and
+  /// before the drawers/presenter are detached, so title globals that own
+  /// ImGui dialogs or immediate textures can be reset. The presentation is
+  /// rebuilt (and OnCreateDialogs runs again) before the next session.
+  virtual void OnPresentationTeardown() {}
+
   // Title-owned text editors (for example GTA IV team/all chat) use this to
   // suspend guest keyboard and pointer polling while ImGui owns text input.
   // The flag is atomic because the input driver queries it from its poll
@@ -273,8 +285,41 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Set a callback that provides guest frame stats to the debug overlay.
   void SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provider);
 
+  /// Starts an in-process return to the hub. Must be called on the UI thread
+  /// while a runtime is active. The completion runs on the UI thread with
+  /// `true` when the old session drained and shut down cleanly and the
+  /// presentation was rebuilt for the next launch. `false` leaves the process
+  /// alive on the old session's resources (a blocked drain or failed rebuild);
+  /// the caller must not report success. Returns false when a restart is
+  /// already running, the process is closing, or no session is active.
+  bool RestartSessionForHub(std::function<void(bool)> completion);
+
+  /// Starts the next guest session after RestartSessionForHub reported success
+  /// (the old session is gone and the presentation was rebuilt). Must run on
+  /// the UI thread, typically from the completion callback or the hub's launch
+  /// handler. Returns false when the runtime cannot be constructed; the rebuilt
+  /// presentation stays live so the host can show the hub again.
+  bool StartSessionAfterReturn(const PathConfig& paths);
+
+  bool session_restart_in_progress() const {
+    return restart_in_progress_.load(std::memory_order_acquire);
+  }
+  uint32_t session_generation() const {
+    return session_generation_.load(std::memory_order_acquire);
+  }
+
  private:
   std::function<void(PathConfig)> MakeResumeCallback();
+
+  // Session restart phases. ConfigureGraphicsBackend builds a fresh backend
+  // config (the first one was consumed by Runtime::Setup); the window is kept
+  // across sessions and only the objects that reference the runtime are
+  // released and rebuilt.
+  bool ConfigureGraphicsBackend();
+  bool CreateMainWindow();
+  bool AttachPresentationStack();
+  void ReleasePresentationStack();
+  bool RebuildPresentationStack();
 
   // Stand up the ImGui overlay stack (drawer, F3/Backtick/F4 binds, dialogs)
   // independently of how the presenter/drawer were obtained. `presenter` may be
@@ -313,7 +358,20 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<Runtime> runtime_;
   std::unique_ptr<ui::Window> window_;
   std::thread module_thread_;
+  // True from module-thread spawn until its body returns. joinable() alone
+  // stays true after the thread finished, so a relaunch uses this to tell an
+  // exited thread (safe to join and replace) from a live one (never joined
+  // from the UI thread).
+  std::atomic<bool> module_thread_live_{false};
   std::atomic<bool> shutting_down_{false};
+  // True from the return-to-hub request until the replacement presentation is
+  // live. The module thread consults it so an intentional session end does not
+  // quit the process, and a second request is refused while it is set.
+  std::atomic<bool> restart_in_progress_{false};
+  std::atomic<uint32_t> session_generation_{0};
+  // The overlay keybinds are global (a duplicate registration is ignored), so
+  // they are registered once and rebind to the current dialogs through `this`.
+  bool overlay_binds_registered_ = false;
   struct InputCaptureState {
     std::atomic<bool> title{false};
     std::atomic<bool> overlay{false};

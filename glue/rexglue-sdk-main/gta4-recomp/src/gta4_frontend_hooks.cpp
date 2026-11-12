@@ -20,6 +20,8 @@
 #include <rex/graphics/gta4_native/anti_aliasing_policy.h>
 #include <rex/graphics/gta4_native/hdr_policy.h>
 #include <rex/graphics/gta4_native/temporal_commands.h>
+#include <rex/input/input.h>
+#include <rex/input/input_system.h>
 #include <rex/input/input_trace.h>
 #include <rex/input/sony_feedback.h>
 #include <rex/logging.h>
@@ -27,11 +29,15 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/interfaces/graphics.h>
 
+#include "gta4_episode_startup_policy.h"
 #include "gta4_frontend_menu_policy.h"
 #include "gta4_draw_distance_policy.h"
 #include "gta4_init.h"
 #include "gta4_touch_coordinator.h"
 #include "input/context_touch_controls.h"
+#include "ps5/lifecycle/f02_game_menu.h"
+#include "ps5/lifecycle/f02_menu_request.h"
+#include "ps5/lifecycle/f02_return_prompt.h"
 
 REXCVAR_DECLARE(std::string, gta4_episode_startup_prompt);
 REXCVAR_DECLARE(int32_t, gta4_start_episode);
@@ -44,6 +50,8 @@ void GTA4_RunWithPrimaryPlayerInfoAlias(PPCContext& ctx, uint8_t* base,
 
 namespace {
 
+namespace f02_game_menu = gta4::ps5::lifecycle::f02::game_menu;
+
 constexpr uint32_t kDisplayScreen = 8;
 constexpr uint32_t kAudioScreen = 7;
 constexpr uint32_t kGameScreen = 9;
@@ -55,6 +63,19 @@ constexpr uint32_t kDisplayOptionsCount = 0x831DAEFC;
 constexpr uint32_t kDisplayOptionsCapacity = 0x831DAEFE;
 constexpr uint32_t kCurrentScreenAddress = 0x82BFA124;
 constexpr uint32_t kPauseMenuActiveAddress = 0x82BF9EF4;
+// The stored pause state (-24260) and the pause mode dword (-31988 from
+// 0x82A90000). The mode is 1 while the in-game pause menu is up; sub_8214B640
+// switches on the pause state only in that mode, and sub_82259328 (list input)
+// runs only while the pause state is 0.
+constexpr uint32_t kStoredPauseStateAddress = 0x82BFA13C;
+constexpr uint32_t kPauseModeAddress = 0x82A97CF4;
+constexpr uint32_t kPauseModeInGameMenu = 1;
+// sub_82254FE0 style 72: the pause-menu message box with the Cross/Circle
+// prompts, i.e. what the retail New Game confirmation uses.
+constexpr uint32_t kMessageBoxStyle = 72;
+// Stock case 16 of sub_8214B640 drives the LG_SURE message box at pause state
+// 18; the list dispatcher is silent for any nonzero pause state.
+constexpr uint32_t kPauseStateConfirm = 18;
 // The pause menu's header (sub_8214F230 steps it with Left/Right, sub_8214F7C0
 // draws it; both get it as r3): the tab it highlights, a screen id, at +24.
 constexpr uint32_t kPauseHeaderAddress = 0x831D5278;
@@ -641,6 +662,35 @@ struct DisplayMenuState {
 };
 
 DisplayMenuState g_display_menu;
+
+// F02 Return to Hub: the published Game page. `rows` is the cloned option
+// array; the game's frontend-menu loader frees whatever array the descriptor
+// publishes when it reloads, so release only has to drop this bookkeeping.
+struct GameMenuExtensionState {
+  bool active = false;
+  uint32_t stock_rows = 0;
+  uint16_t stock_count = 0;
+  uint16_t stock_capacity = 0;
+  uint32_t rows = 0;
+  uint16_t count = 0;
+  uint32_t allocation = 0;
+  uint32_t label_address = 0;
+  uint32_t confirm_key_address = 0;
+  uint32_t dialog_text_address = 0;
+  uint16_t return_index = 0;
+  bool replaced_marketplace = false;
+};
+GameMenuExtensionState g_game_menu;
+
+// F02 Return to Hub: the native confirmation. It runs in this guest pause frame
+// hook, which is the only reader of the pad while the message box is up. The
+// retail pause state is parked at 18 (the New Game confirmation's state), so
+// the stock pause input and list dispatch stay silent.
+gta4::ps5::lifecycle::f02::ReturnConfirmation g_return_confirmation;
+uint32_t g_return_confirmation_pause_state = 0;
+bool g_return_confirmation_dialog_open = false;
+uint64_t g_return_confirmation_sequence = 0;
+
 uint32_t g_last_frontend_channel = 0;
 std::filesystem::path g_config_path;
 uint64_t g_menu_trace_sequence = 0;
@@ -850,6 +900,78 @@ PPCContext InvokeGuest(PPCContext& parent, uint8_t* base, PPCFunc function, uint
   nested.r5.u64 = r5;
   function(nested, base);
   return nested;
+}
+
+PPCContext InvokeGuest(PPCContext& parent, uint8_t* base, PPCFunc function, uint64_t r3,
+                       uint64_t r4, uint64_t r5, uint64_t r6, uint64_t r7, uint64_t r8,
+                       uint64_t r9, uint64_t r10) {
+  PPCContext nested = parent;
+  nested.r3.u64 = r3;
+  nested.r4.u64 = r4;
+  nested.r5.u64 = r5;
+  nested.r6.u64 = r6;
+  nested.r7.u64 = r7;
+  nested.r8.u64 = r8;
+  nested.r9.u64 = r9;
+  nested.r10.u64 = r10;
+  function(nested, base);
+  return nested;
+}
+
+// The merged UI pad, the same source the native XAM dialogs use. It is
+// independent of the title's own input callback, so the pause menu cannot see
+// the press the confirmation consumes.
+uint16_t ReadUiPadButtons() {
+  using namespace rex::input;
+  auto* kernel_state = REX_KERNEL_STATE();
+  auto* emulator = kernel_state ? kernel_state->emulator() : nullptr;
+  auto* input = emulator ? static_cast<InputSystem*>(emulator->input_system()) : nullptr;
+  X_INPUT_GAMEPAD pad{};
+  if (!input || !input->GetUiGamepadState(&pad)) {
+    return 0;
+  }
+  uint16_t buttons = static_cast<uint16_t>(pad.buttons);
+  const int16_t lx = static_cast<int16_t>(pad.thumb_lx);
+  const int16_t ly = static_cast<int16_t>(pad.thumb_ly);
+  if (lx < -16000) buttons |= X_INPUT_GAMEPAD_DPAD_LEFT;
+  if (lx > 16000) buttons |= X_INPUT_GAMEPAD_DPAD_RIGHT;
+  if (ly > 16000) buttons |= X_INPUT_GAMEPAD_DPAD_UP;
+  if (ly < -16000) buttons |= X_INPUT_GAMEPAD_DPAD_DOWN;
+  return buttons;
+}
+
+// The retail message box the New Game confirmation uses: style 72, the F02
+// confirm key (whose text sub_8221FD88 substitutes), and no secondary line.
+void OpenReturnDialog(PPCContext& ctx, uint8_t* base) {
+  if (g_game_menu.confirm_key_address == 0) {
+    return;
+  }
+  InvokeGuest(ctx, base, sub_82254FE0, 0, g_game_menu.confirm_key_address, kMessageBoxStyle,
+              0, ~uint64_t{0}, 0, 0, 0);
+  g_return_confirmation_dialog_open = true;
+}
+
+void CloseReturnDialog(PPCContext& ctx, uint8_t* base) {
+  if (!g_return_confirmation_dialog_open) {
+    return;
+  }
+  InvokeGuest(ctx, base, sub_8224FA38);
+  g_return_confirmation_dialog_open = false;
+}
+
+// Drops the confirmation and gives the retail pause menu back exactly the state
+// it had before the row was chosen. Runs on the guest thread.
+void ResetReturnConfirmation(PPCContext& ctx, uint8_t* base) {
+  if (g_return_confirmation.active()) {
+    CloseReturnDialog(ctx, base);
+    REX_STORE_U32(kStoredPauseStateAddress, g_return_confirmation_pause_state);
+    REXLOG_INFO(
+        "F02 Game page: confirmation dropped; pause state restored to {} (sequence {})",
+        g_return_confirmation_pause_state, g_return_confirmation_sequence);
+  }
+  g_return_confirmation.Reset();
+  g_return_confirmation_dialog_open = false;
+  g_return_confirmation_pause_state = 0;
 }
 
 std::string ReadGuestString(uint8_t* base, uint32_t address, uint32_t capacity) {
@@ -1575,6 +1697,154 @@ void InstallDisplayExtension(PPCContext& ctx, uint8_t* base) {
       g_display_menu.stock_rows, g_display_menu.allocation, allocation_bytes);
 }
 
+void ReleaseGameMenuExtension(PPCContext& ctx, uint8_t* base) {
+  if (!g_game_menu.active) {
+    return;
+  }
+  const uint32_t vector = ScreenOptionsAddress(f02_game_menu::kGameScreen);
+  const uint32_t published_rows = REX_LOAD_U32(vector);
+  const uint16_t published_count = REX_LOAD_U16(vector + 4);
+  // The frontend-menu loader resets every descriptor and frees the published
+  // option array before it calls the parser, so normally there is nothing
+  // left to free here. The check keeps a direct call orderly (and avoids a
+  // double free if the loader already reclaimed the clone).
+  const bool still_published =
+      published_rows == g_game_menu.rows && published_count == g_game_menu.count;
+  if (still_published) {
+    REX_STORE_U32(vector, g_game_menu.stock_rows);
+    REX_STORE_U16(vector + 4, g_game_menu.stock_count);
+    REX_STORE_U16(vector + 6, g_game_menu.stock_capacity);
+    if (g_game_menu.allocation != 0) {
+      InvokeGuest(ctx, base, sub_821B3560, g_game_menu.allocation);
+    }
+  }
+  REXLOG_INFO(
+      "F02 Game page: release clone={:08X} count={} still-published={} restored={:08X}",
+      g_game_menu.rows, g_game_menu.count, still_published, g_game_menu.stock_rows);
+  g_game_menu = {};
+}
+
+void InstallGameMenuExtension(PPCContext& ctx, uint8_t* base) {
+  if (g_game_menu.active) {
+    return;
+  }
+  const uint32_t vector = ScreenOptionsAddress(f02_game_menu::kGameScreen);
+  const uint32_t stock_rows = REX_LOAD_U32(vector);
+  const uint16_t stock_count = REX_LOAD_U16(vector + 4);
+  const uint16_t stock_capacity = REX_LOAD_U16(vector + 6);
+  if (stock_rows == 0 || stock_count == 0) {
+    REXLOG_WARN("F02 Game page: no stock Game page rows; row not installed");
+    return;
+  }
+  if (stock_count > f02_game_menu::kRetailListSlotCapacity) {
+    REXLOG_ERROR("F02 Game page: stock count {} exceeds the retail list capacity; row not installed",
+                 stock_count);
+    return;
+  }
+  const std::size_t stock_span_bytes = static_cast<std::size_t>(stock_count) *
+                                       f02_game_menu::kOptionRecordSize;
+  if (!IsGuestSpanValid(stock_rows, stock_span_bytes)) {
+    REXLOG_ERROR("F02 Game page: invalid stock span {:08X}+{}; row not installed", stock_rows,
+                 stock_span_bytes);
+    return;
+  }
+
+  std::array<std::string, f02_game_menu::kRetailListSlotCapacity> keys;
+  std::array<f02_game_menu::RowInfo, f02_game_menu::kRetailListSlotCapacity> rows;
+  for (uint16_t index = 0; index < stock_count; ++index) {
+    const uint32_t record =
+        stock_rows + static_cast<uint32_t>(index) * f02_game_menu::kOptionRecordSize;
+    keys[index] = ReadGuestString(base, record + kOptionLabelOffset, kOptionLabelCapacity);
+    rows[index] = f02_game_menu::RowInfo{
+        .action = REX_LOAD_U8(record + kOptionActionOffset),
+        .key = keys[index],
+        .value = REX_LOAD_U16(record + kOptionValueOffset),
+    };
+  }
+  const f02_game_menu::Plan plan = f02_game_menu::PlanGameMenu(rows.data(), stock_count);
+  if (!plan.valid) {
+    REXLOG_ERROR(
+        "F02 Game page: incompatible stock page (count={} end-row not found or no room); row not "
+        "installed",
+        stock_count);
+    return;
+  }
+
+  const std::size_t rows_bytes =
+      plan.output_count * f02_game_menu::kOptionRecordSize;
+  const std::size_t label_bytes = f02_game_menu::kReturnToHubLabel.size() + 1;
+  const std::size_t confirm_key_bytes = f02_game_menu::kReturnToHubConfirmKey.size() + 1;
+  const std::size_t dialog_text_bytes = f02_game_menu::kReturnToHubDialogText.size() + 1;
+  const std::size_t allocation_bytes =
+      rows_bytes + label_bytes + confirm_key_bytes + dialog_text_bytes;
+  if (allocation_bytes > std::numeric_limits<uint32_t>::max()) {
+    REXLOG_ERROR("F02 Game page: allocation overflow {}", allocation_bytes);
+    return;
+  }
+  const uint32_t allocation =
+      InvokeGuest(ctx, base, sub_821B3510, static_cast<uint32_t>(allocation_bytes)).r3.u32;
+  if (allocation == 0 || !IsGuestSpanValid(allocation, allocation_bytes)) {
+    REXLOG_ERROR("F02 Game page: allocation of {} bytes failed", allocation_bytes);
+    if (allocation != 0) {
+      InvokeGuest(ctx, base, sub_821B3560, allocation);
+    }
+    return;
+  }
+
+  if (!f02_game_menu::ComposeGameMenu(reinterpret_cast<const uint8_t*>(base + stock_rows),
+                                      stock_count,
+                                      reinterpret_cast<uint8_t*>(base + allocation), plan)) {
+    REXLOG_ERROR("F02 Game page: the stock page changed while composing the clone; not installed");
+    InvokeGuest(ctx, base, sub_821B3560, allocation);
+    return;
+  }
+  const uint32_t label_address = allocation + static_cast<uint32_t>(rows_bytes);
+  std::memcpy(base + label_address, f02_game_menu::kReturnToHubLabel.data(),
+              f02_game_menu::kReturnToHubLabel.size());
+  REX_STORE_U8(label_address + f02_game_menu::kReturnToHubLabel.size(), 0);
+  const uint32_t confirm_key_address = label_address + static_cast<uint32_t>(label_bytes);
+  std::memcpy(base + confirm_key_address, f02_game_menu::kReturnToHubConfirmKey.data(),
+              f02_game_menu::kReturnToHubConfirmKey.size());
+  REX_STORE_U8(confirm_key_address + f02_game_menu::kReturnToHubConfirmKey.size(), 0);
+  const uint32_t dialog_text_address =
+      confirm_key_address + static_cast<uint32_t>(confirm_key_bytes);
+  std::memcpy(base + dialog_text_address, f02_game_menu::kReturnToHubDialogText.data(),
+              f02_game_menu::kReturnToHubDialogText.size());
+  REX_STORE_U8(dialog_text_address + f02_game_menu::kReturnToHubDialogText.size(), 0);
+
+  REX_STORE_U32(vector, allocation);
+  REX_STORE_U16(vector + 4, static_cast<uint16_t>(plan.output_count));
+  REX_STORE_U16(vector + 6, static_cast<uint16_t>(plan.output_count));
+
+  g_game_menu.active = true;
+  g_game_menu.stock_rows = stock_rows;
+  g_game_menu.stock_count = stock_count;
+  g_game_menu.stock_capacity = stock_capacity;
+  g_game_menu.rows = allocation;
+  g_game_menu.count = static_cast<uint16_t>(plan.output_count);
+  g_game_menu.allocation = allocation;
+  g_game_menu.label_address = label_address;
+  g_game_menu.confirm_key_address = confirm_key_address;
+  g_game_menu.dialog_text_address = dialog_text_address;
+  g_game_menu.return_index = static_cast<uint16_t>(plan.return_index);
+  g_game_menu.replaced_marketplace = plan.replaced_marketplace;
+
+  // A fresh frontend load starts a new session: no confirmation from the
+  // previous one may survive.
+  g_return_confirmation.Reset();
+  g_return_confirmation_dialog_open = false;
+  g_return_confirmation_pause_state = 0;
+
+  REXLOG_INFO(
+      "F02 Game page: published Return to Hub at row {} of {} ({}); stock={:08X}/{} "
+      "clone={:08X} label={:08X} key={:08X} dialog={:08X} '{}'",
+      plan.return_index, plan.output_count,
+      plan.replaced_marketplace ? "after Auto Save, Marketplace dropped" : "inserted after Auto Save",
+      stock_rows,
+      stock_count, allocation, label_address, confirm_key_address, dialog_text_address,
+      f02_game_menu::kReturnToHubLabel);
+}
+
 void SwitchDisplayPage(PPCContext& ctx, uint8_t* base, gta4::frontend_menu::policy::Page page,
                        uint16_t selected_row, std::size_t native_page = 0) {
   if (page == gta4::frontend_menu::policy::Page::kAdvanced) {
@@ -1761,6 +2031,18 @@ void SetConfigPath(std::filesystem::path path) {
   g_config_path = std::move(path);
 }
 
+void ResetSession() {
+  // Discard ownership after the guest drain, without freeing into another arena.
+  g_game_menu = {};
+  g_display_menu = {};
+  g_return_confirmation.Reset();
+  g_return_confirmation_pause_state = 0;
+  g_return_confirmation_dialog_open = false;
+  g_last_frontend_channel = 0;
+  g_menu_trace_label_calls = 0;
+  g_menu_trace_value_calls = 0;
+}
+
 bool SwitchPauseTab(PPCContext& parent, uint8_t* base, policy::PauseTabDirection direction,
                     uint32_t* previous_screen, uint32_t* target_screen) {
   // The header's tab, not only the screen: the header highlights its own
@@ -1827,8 +2109,6 @@ constexpr uint32_t kNewEpisodeAddress = 0x82BF9864;
 // to the episode the profile played last (sub_8221B198, from the profile's
 // flags) before asking sub_82241428; the question's Yes sets it to the new one.
 constexpr uint32_t kStartEpisodeAddress = 0x82BF9858;
-int32_t g_answer_yes_for = -1;  // (the episode whose question is answered)
-bool g_start_episode_used = false;  // (the start only: later checks are the game's)
 // [ps5 port] Past the question, the start scans the saves (sub_822440F8's
 // states 1-2): sub_822409F0 resets the start episode to the profile's last
 // one, then sub_82240798 runs for each save and keeps the newest of ANY
@@ -1842,8 +2122,6 @@ constexpr uint32_t kSaveTableAddress = 0x82BF3D98;      // (XCONTENT_DATA, 308 b
 constexpr uint32_t kSaveEntrySize = 308;
 constexpr uint32_t kSaveDisplayNameOffset = 8;          // (UTF-16BE, 128)
 constexpr uint32_t kSaveFileNameOffset = 264;           // ("SGTA4NN")
-int32_t g_boot_episode = -1;    // (the Home choice, while the start's steps run)
-bool g_in_start_steps = false;  // (inside sub_822440F8)
 }  // namespace
 
 namespace {
@@ -1865,9 +2143,9 @@ std::string SaveDisplayName(uint8_t* base, uint32_t slot) {
 extern "C" void sub_82241428(PPCContext& ctx, uint8_t* base) {
   __imp__sub_82241428(ctx, base);  // (keeps the profile's list of episodes seen)
   const int32_t retail_episode = ctx.r3.s32;
+  auto& session = gta4::episode_startup::Session();
   const int32_t start = REXCVAR_GET(gta4_start_episode);
-  if (start >= 0 && !g_start_episode_used) {
-    g_start_episode_used = true;
+  if (session.ConsumeHomeChoice(start)) {
     // (No installed check here: question 52's own, sub_8221A0D0, said "not
     // there" for installed episodes in 1.0.1 testers' logs, and the hub only
     // offers installed episodes.)
@@ -1876,7 +2154,7 @@ extern "C" void sub_82241428(PPCContext& ctx, uint8_t* base) {
     // skip the scan (no saves): those start the choice new.
     ctx.r3.s64 = -1;
     REX_STORE_U32(kStartEpisodeAddress, static_cast<uint32_t>(start));
-    g_boot_episode = start;
+    session.boot_episode = start;
     REXLOG_INFO("GTA IV episode startup: episode {} chosen on Home (retail result {}); its newest save, "
                 "else a new game",
                 start, retail_episode);
@@ -1900,31 +2178,34 @@ extern "C" void sub_82241428(PPCContext& ctx, uint8_t* base) {
 
 // The start's steps: 1 is a new game in kStartEpisodeAddress, 2 loads kBootSlotAddress.
 extern "C" void sub_822440F8(PPCContext& ctx, uint8_t* base) {
-  g_in_start_steps = true;
+  auto& session = gta4::episode_startup::Session();
+  session.in_start_steps = true;
   __imp__sub_822440F8(ctx, base);
-  g_in_start_steps = false;
-  if (g_boot_episode >= 0 && ctx.r3.s32 != 0) {
+  session.in_start_steps = false;
+  if (session.boot_episode >= 0 && ctx.r3.s32 != 0) {
     const int32_t episode = static_cast<int32_t>(REX_LOAD_U32(kStartEpisodeAddress));
     const int32_t slot = static_cast<int32_t>(REX_LOAD_U32(kBootSlotAddress));
     if (ctx.r3.s32 == 2 && slot >= 0)
       REXLOG_INFO("GTA IV episode startup: loading {} (episode {})", SaveFileName(base, uint32_t(slot)), episode);
     else
       REXLOG_INFO("GTA IV episode startup: no save of episode {}; starting it new", episode);
-    g_boot_episode = -1;  // (later scans, the pause menu's Load, are the game's own)
+    session.boot_episode = -1;  // (later scans, the pause menu's Load, are the game's own)
   }
 }
 
 // The scan's reset sets the start episode to the profile's last: the choice back.
 extern "C" void sub_822409F0(PPCContext& ctx, uint8_t* base) {
   __imp__sub_822409F0(ctx, base);
-  if (g_in_start_steps && g_boot_episode >= 0)
-    REX_STORE_U32(kStartEpisodeAddress, static_cast<uint32_t>(g_boot_episode));
+  auto& session = gta4::episode_startup::Session();
+  if (session.in_start_steps && session.boot_episode >= 0)
+    REX_STORE_U32(kStartEpisodeAddress, static_cast<uint32_t>(session.boot_episode));
 }
 
 // Each save's "newest so far?": during the start with a Home choice, a save of
 // another episode that won is undone, so the newest save of the choice wins.
 extern "C" void sub_82240798(PPCContext& ctx, uint8_t* base) {
-  if (!g_in_start_steps || g_boot_episode < 0 || (ctx.r4.u32 & 0xFF) == 0) {
+  auto& session = gta4::episode_startup::Session();
+  if (!session.in_start_steps || session.boot_episode < 0 || (ctx.r4.u32 & 0xFF) == 0) {
     __imp__sub_82240798(ctx, base);
     return;
   }
@@ -1936,7 +2217,7 @@ extern "C" void sub_82240798(PPCContext& ctx, uint8_t* base) {
   __imp__sub_82240798(ctx, base);
   if (REX_LOAD_U32(kBootSlotAddress) != slot || previous_slot == slot) return;  // (not newer)
   const int32_t save_episode = static_cast<int32_t>(REX_LOAD_U32(kStartEpisodeAddress));
-  if (save_episode == g_boot_episode) {
+  if (save_episode == session.boot_episode) {
     REXLOG_INFO("GTA IV episode startup: {} '{}' (episode {}) is the newest so far", SaveFileName(base, slot),
                 SaveDisplayName(base, slot), save_episode);
     return;
@@ -1945,15 +2226,21 @@ extern "C" void sub_82240798(PPCContext& ctx, uint8_t* base) {
   for (uint32_t i = 0; i < 3; ++i) REX_STORE_U32(kStartEpisodeAddress + i * 4, episode_words[i]);
   REX_STORE_U32(kBootSlotAddress, previous_slot);
   REXLOG_INFO("GTA IV episode startup: skipping {} '{}' (episode {}, not {})", SaveFileName(base, slot),
-              SaveDisplayName(base, slot), save_episode, g_boot_episode);
+              SaveDisplayName(base, slot), save_episode, session.boot_episode);
 }
 
 extern "C" void sub_82157F90(PPCContext& ctx, uint8_t* base) {
+#if REX_PLATFORM_PS5
+  ReleaseGameMenuExtension(ctx, base);
+#endif
   ReleaseDisplayExtension(ctx, base);
   __imp__sub_82157F90(ctx, base);
   TraceScreenRows(base, "stock-loaded", kAudioScreen);
   TraceScreenRows(base, "stock-loaded", kDisplayScreen);
   InstallDisplayExtension(ctx, base);
+#if REX_PLATFORM_PS5
+  InstallGameMenuExtension(ctx, base);
+#endif
   TraceScreenRows(base, "extension-published", kAudioScreen);
   TraceScreenRows(base, "extension-published", kDisplayScreen);
 }
@@ -1966,6 +2253,21 @@ extern "C" void sub_8221FD88(PPCContext& ctx, uint8_t* base) {
   const uint32_t key_address = ctx.r4.u32;
   const uint32_t caller = ctx.lr;
   const uint32_t screen = diagnostics ? REX_LOAD_U32(kCurrentScreenAddress) : 0;
+  // The F02 confirmation message box resolves its own key here (the layout
+  // builds the message through sub_8224CF58, which calls this with the key
+  // the opener copied). The returned text is the native message body.
+  if (g_game_menu.active && g_game_menu.dialog_text_address != 0 &&
+      GuestStringEquals(base, key_address, f02_game_menu::kReturnToHubConfirmKey,
+                        kOptionLabelCapacity)) {
+    ctx.r3.u64 = g_game_menu.dialog_text_address;
+    return;
+  }
+  if (g_game_menu.active && g_game_menu.label_address != 0 &&
+      REX_LOAD_U32(kCurrentScreenAddress) == f02_game_menu::kGameScreen &&
+      GuestStringEquals(base, key_address, f02_game_menu::kReturnToHubKey, kOptionLabelCapacity)) {
+    ctx.r3.u64 = g_game_menu.label_address;
+    return;
+  }
   TextId custom_text = TextId::kCount;
   if (IsDisplayScreen(base) && FindOwnedLabelText(base, key_address, custom_text)) {
     const uint32_t text_address = TextAddress(custom_text);
@@ -2000,12 +2302,13 @@ extern "C" void sub_8223F9F0(PPCContext& ctx, uint8_t* base) {
   // and the save-block serializer. Observe them without changing save flow.
   thread_local uint32_t previous_reason = std::numeric_limits<uint32_t>::max();
   const uint32_t reason = ctx.r3.u32;
-  if (reason == kNewEpisodeQuestion && g_answer_yes_for > 0 &&
-      static_cast<int32_t>(REX_LOAD_U32(kNewEpisodeAddress)) == g_answer_yes_for) {
+  auto& session = gta4::episode_startup::Session();
+  if (reason == kNewEpisodeQuestion && session.answer_yes_for > 0 &&
+      static_cast<int32_t>(REX_LOAD_U32(kNewEpisodeAddress)) == session.answer_yes_for) {
     REX_STORE_U8(ctx.r5.u32, 1);  // (Yes)
     ctx.r3.u64 = 1;               // (answered)
-    REXLOG_INFO("GTA IV episode startup: starting in episode {}", g_answer_yes_for);
-    g_answer_yes_for = -1;
+    REXLOG_INFO("GTA IV episode startup: starting in episode {}", session.answer_yes_for);
+    session.answer_yes_for = -1;
     return;
   }
   const char* stage = nullptr;
@@ -2235,6 +2538,24 @@ extern "C" void sub_8229CD40(PPCContext& ctx, uint8_t* base) {
         "GTA IV native menu: rejected invalid UI row payload {:08X}+{} count={}", row_payload,
         payload_bytes, count);
   }
+  // The Game page's list build copies each option's raw key into the 68-byte
+  // UI record, so the Return to Hub row would draw its internal key. Replace
+  // just that record's text with the resolved label before the widget sees it.
+  const bool is_owned_game_list =
+      g_game_menu.active && g_menu_trace_page_screen == f02_game_menu::kGameScreen &&
+      count > 0 && list_index == 0 && caller == kLeftListBuildReturnAddress &&
+      static_cast<uint16_t>(count) == g_game_menu.count &&
+      g_game_menu.return_index < static_cast<uint16_t>(count) &&
+      REX_LOAD_U32(ScreenOptionsAddress(f02_game_menu::kGameScreen)) == g_game_menu.rows;
+  if (is_owned_game_list &&
+      IsGuestSpanValid(row_payload, static_cast<std::size_t>(count) * kUiRowRecordSize)) {
+    const uint32_t payload_row =
+        row_payload + static_cast<uint32_t>(g_game_menu.return_index) * kUiRowRecordSize;
+    if (GuestStringEquals(base, payload_row, f02_game_menu::kReturnToHubKey,
+                          kOptionLabelCapacity)) {
+      WriteUiRowLabel(base, payload_row, f02_game_menu::kReturnToHubLabel);
+    }
+  }
   if (trace_page) {
     REXLOG_INFO(
         "GTA4MenuTrace seq={} point=retail-list-build-enter screen={}({}) caller={:08X} "
@@ -2323,9 +2644,67 @@ extern "C" void sub_82253370(PPCContext& ctx, uint8_t* base) {
   __imp__sub_82253370(ctx, base);
 }
 
+// The pause menu's Game page was activated on the Return to Hub row: the row
+// is the stock jump action with the F02 sentinel screen, and its label key is
+// the one the label resolver maps to "Return to Hub". The retail dispatcher
+// is not allowed to run: it would switch to the sentinel screen and advance
+// the pause-menu state. Selecting the row opens the retail New Game message
+// box instead; nothing is posted until the player accepts it.
+bool TryActivateReturnToHub(PPCContext& ctx, uint32_t menu_index, int32_t selected_row,
+                            uint8_t* base) {
+  if (!g_game_menu.active || selected_row < 0 ||
+      static_cast<uint32_t>(selected_row) >= g_game_menu.count) {
+    return false;
+  }
+  const uint32_t screen = REX_LOAD_U32(kCurrentScreenAddress);
+  const uint32_t record =
+      g_game_menu.rows + static_cast<uint32_t>(selected_row) * kOptionRecordSize;
+  const uint8_t action = REX_LOAD_U8(record + kOptionActionOffset);
+  const uint16_t value = REX_LOAD_U16(record + kOptionValueOffset);
+  if (!f02_game_menu::IsReturnToHubActivation(menu_index, screen, action, value)) {
+    return false;
+  }
+  if (!GuestStringEquals(base, record + kOptionLabelOffset, f02_game_menu::kReturnToHubKey,
+                         kOptionLabelCapacity)) {
+    return false;
+  }
+  if (g_return_confirmation.active()) {
+    // A repeat or held activation is not a second request; the open box owns
+    // the pad until it is answered.
+    return true;
+  }
+  const uint32_t pause_state = REX_LOAD_U32(kStoredPauseStateAddress);
+  if (!g_return_confirmation.Begin(ReadUiPadButtons())) {
+    return true;
+  }
+  ++g_return_confirmation_sequence;
+  g_return_confirmation_pause_state = pause_state;
+  // Park the pause machine in the state the retail New Game confirmation uses.
+  // Every nonzero pause state silences the list dispatch (sub_82259328), so the
+  // Game page cannot act on the press that opened the box or anything after it.
+  REX_STORE_U32(kStoredPauseStateAddress, kPauseStateConfirm);
+  OpenReturnDialog(ctx, base);
+  REXLOG_INFO(
+      "F02 Game page: Return to Hub selected (row {} of {}); native confirmation opened "
+      "(sequence {}, pause state {} -> {})",
+      selected_row, g_game_menu.count, g_return_confirmation_sequence, pause_state,
+      kPauseStateConfirm);
+  return true;
+}
+
 extern "C" void sub_82258388(PPCContext& ctx, uint8_t* base) {
+  if (g_return_confirmation.active()) {
+    // The pause frame update is skipped while the box is up, but a row
+    // activation can still arrive through another reader. It must not act.
+    ctx.r3.u64 = 1;
+    return;
+  }
   const uint32_t frontend_channel = ctx.r3.u32;
   const int32_t selected_row = ctx.r4.s32;
+  if (TryActivateReturnToHub(ctx, frontend_channel, selected_row, base)) {
+    ctx.r3.u64 = 1;
+    return;
+  }
   if (IsDisplayScreen(base) && IsOwnedAdvancedPage(base) &&
       IsOwnedJumpRow(base, selected_row, kTouchLayoutEditorKey)) {
     if (!gta4::input::ContextTouchEditorCapturesInput()) {
@@ -2410,7 +2789,81 @@ extern "C" void sub_82258388(PPCContext& ctx, uint8_t* base) {
   GTA4_RunWithPrimaryPlayerInfoAlias(ctx, base, __imp__sub_82258388);
 }
 
+// The in-game pause frame. While the F02 confirmation is up this hook replaces
+// the retail update entirely: the retail input dispatch, the pause state
+// machine and the message-box watchdog all live there, and letting any of them
+// see the pad is what leaked input into the underlying menu. The message box is
+// re-opened every frame exactly like the retail New Game driver does.
+extern "C" void sub_8214C8C8(PPCContext& ctx, uint8_t* base) {
+  namespace f02_confirm = gta4::ps5::lifecycle::f02;
+  if (f02_confirm::ConsumeConfirmationReset()) {
+    ResetReturnConfirmation(ctx, base);
+  }
+  if (!g_return_confirmation.active()) {
+    __imp__sub_8214C8C8(ctx, base);
+    return;
+  }
+  const uint32_t pause_mode = REX_LOAD_U32(kPauseModeAddress);
+  const uint32_t screen = REX_LOAD_U32(kCurrentScreenAddress);
+  if (pause_mode != kPauseModeInGameMenu || screen != f02_game_menu::kGameScreen) {
+    // The pause menu went away underneath the box: drop it and give the frame
+    // back to the retail code.
+    ResetReturnConfirmation(ctx, base);
+    __imp__sub_8214C8C8(ctx, base);
+    return;
+  }
+  if (g_return_confirmation.state() == f02_confirm::ConfirmState::kAwaitRelease) {
+    // State 18 belongs to New Game; never hand it back after dismissing our dialog.
+    REX_STORE_U32(kStoredPauseStateAddress, g_return_confirmation_pause_state);
+    g_return_confirmation.Update(ReadUiPadButtons());
+    if (!g_return_confirmation.active()) {
+      REXLOG_INFO("F02 Game page: input released (sequence {}); retail resumes at pause state {}",
+                  g_return_confirmation_sequence, g_return_confirmation_pause_state);
+    }
+    return;
+  }
+  REX_STORE_U32(kStoredPauseStateAddress, kPauseStateConfirm);
+  if (g_return_confirmation.committed()) {
+    OpenReturnDialog(ctx, base);
+    return;
+  }
+  if (g_return_confirmation.dialog_open()) {
+    OpenReturnDialog(ctx, base);
+  }
+  const f02_confirm::ConfirmAction action =
+      g_return_confirmation.Update(ReadUiPadButtons());
+  if (action == f02_confirm::ConfirmAction::kCommit) {
+    REXLOG_INFO(
+        "F02 Game page: native confirmation accepted (sequence {}); posting one return request",
+        g_return_confirmation_sequence);
+    f02_confirm::RequestReturnFromMenu();
+    return;
+  }
+  if (action == f02_confirm::ConfirmAction::kDismiss) {
+    // Give the Game page back at once; the retail frame stays frozen until
+    // Cross and Circle are released so the cancel press cannot close the menu.
+    CloseReturnDialog(ctx, base);
+    REX_STORE_U32(kStoredPauseStateAddress, g_return_confirmation_pause_state);
+    REXLOG_INFO(
+        "F02 Game page: native confirmation dismissed (sequence {}); pause state restored to {}",
+        g_return_confirmation_sequence, g_return_confirmation_pause_state);
+    return;
+  }
+}
+
 extern "C" void sub_82256D08(PPCContext& ctx, uint8_t* base) {
+  // Defense in depth: if some other path resolves the sentinel, do not let it
+  // write an out-of-range screen id or advance the pause-menu state. The return
+  // request has exactly one site (the confirmation's accept path), so this
+  // never posts one.
+  if (g_game_menu.active && ctx.r4.s32 == static_cast<int16_t>(f02_game_menu::kReturnToHubValue) &&
+      REX_LOAD_U32(kCurrentScreenAddress) == f02_game_menu::kGameScreen) {
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+      REXLOG_WARN("F02 Game page: blocked the Return to Hub sentinel screen (no request posted)");
+    }
+    return;
+  }
   if (gta4::frontend_menu::policy::ShouldRestorePrimaryBeforeSwitch(g_display_menu.page, ctx.r4.u32,
                                                                     kDisplayScreen)) {
     PublishPrimaryPage(base);

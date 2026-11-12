@@ -15,8 +15,16 @@ endif()
 if(NOT PS5_PAYLOAD_SDK OR NOT EXISTS "${PS5_PAYLOAD_SDK}/toolchain/prospero.cmake")
   message(FATAL_ERROR "Set PS5_PAYLOAD_SDK to the PS5 payload SDK root")
 endif()
+find_program(PS5_F02_PYTHON NAMES python3 REQUIRED)
+execute_process(
+  COMMAND "${PS5_F02_PYTHON}" "${CMAKE_CURRENT_LIST_DIR}/../tools/prepare_f02_sdk.py"
+          --verify "${PS5_PAYLOAD_SDK}"
+  RESULT_VARIABLE PS5_F02_SDK_RESULT)
+if(NOT PS5_F02_SDK_RESULT EQUAL 0)
+  message(FATAL_ERROR "Prepare a clean F02 SDK with ps5/tools/prepare_f02_sdk.py")
+endif()
 # Pass it through to try_compile projects.
-list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES PS5_PAYLOAD_SDK)
+list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES PS5_PAYLOAD_SDK PS5_F02_PYTHON)
 
 include("${PS5_PAYLOAD_SDK}/toolchain/prospero.cmake")
 set(CMAKE_VERBOSE_MAKEFILE OFF CACHE BOOL "" FORCE)

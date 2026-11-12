@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <filesystem>
 #include <span>
 #include <string>
 
@@ -20,6 +21,7 @@
 namespace rex::filesystem {
 
 class HostPathEntry;
+class WriteActivityTracker;
 
 class HostPathFile : public File {
  public:
@@ -36,6 +38,10 @@ class HostPathFile : public File {
 
  private:
   std::unique_ptr<rex::filesystem::FileHandle> file_handle_;
+  // Set only for write-capable opens on a save-backed device. Flushed and
+  // ended on destruction so save completion is observable.
+  std::shared_ptr<WriteActivityTracker> write_tracker_;
+  std::filesystem::path tracked_path_;
 };
 
 }  // namespace rex::filesystem

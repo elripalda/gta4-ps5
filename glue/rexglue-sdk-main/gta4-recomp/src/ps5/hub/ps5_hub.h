@@ -20,6 +20,10 @@ const Assets& Fonts();
 // Shows the hub; `launch` runs (on the UI thread) on START GAME.
 void Show(rex::ui::ImGuiDrawer* drawer, rex::ui::ImmediateDrawer* immediate, const Paths& paths,
           std::function<void()> launch);
+// Drops the pictures loaded by Show, before the ImmediateDrawer that made them
+// is destroyed (an in-process return to the hub rebuilds the drawer). The next
+// Show loads them again.
+void ResetTextures();
 // Xbox 360 save import on the Saves page (before Show).
 void SetSaveImport(Hub::SaveImport import);
 // The Refresh Rate's switch on the Display page (before Show).

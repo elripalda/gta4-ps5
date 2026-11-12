@@ -442,7 +442,7 @@ X_STATUS XThread::Create() {
   rex::thread::Thread::CreationParameters params;
   params.stack_size = 16_MiB;  // Allocate a big host stack.
   params.create_suspended = true;
-  thread_ = rex::thread::Thread::Create(params, [this]() {
+  thread_ = rex::thread::Thread::Create(params, [this, host_exited = host_exited_]() {
     rex::initialize_seh_thread();
     runtime::ThreadState::Bind(thread_state_.get());
 
@@ -457,6 +457,7 @@ X_STATUS XThread::Create() {
 
     // Execute user code.
     current_xthread_tls_ = this;
+    started_.store(true, std::memory_order_release);
     running_ = true;
     Execute();
     running_ = false;
@@ -465,8 +466,10 @@ X_STATUS XThread::Create() {
     PROFILE_THREAD_EXITED();
     PROFILE_THREAD_EXIT();
 
-    // Release the self-reference to the thread.
+    // Release the self-reference to the thread. This may delete `this`, so the
+    // host-exit signal is published through the shared token afterwards.
     ReleaseHandle();
+    host_exited->store(true, std::memory_order_release);
   });
 
   if (!thread_) {
@@ -544,7 +547,13 @@ X_STATUS XThread::Exit(int exit_code) {
   PROFILE_THREAD_EXIT();
 
   running_ = false;
+  // Keep the exit token alive even if ReleaseHandle() destroys `this`.
+  auto host_exited = host_exited_;
   ReleaseHandle();
+
+  // No runtime state is touched after this point; teardown may proceed once
+  // the cooperative drain observes it.
+  host_exited->store(true, std::memory_order_release);
 
   // NOTE: this does not return!
   rex::thread::Thread::Exit(exit_code);
@@ -566,8 +575,10 @@ X_STATUS XThread::Terminate(int exit_code) {
     // Same lifetime rule as Exit(): don't allow ReleaseHandle() to destroy
     // the thread object before Thread::Exit() reaches pthread_exit().
     auto self = retain_object(this);
+    auto host_exited = host_exited_;
     FreeStack();
     ReleaseHandle();
+    host_exited->store(true, std::memory_order_release);
     rex::thread::Thread::Exit(exit_code);
   } else {
     thread_->Terminate(exit_code);

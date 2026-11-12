@@ -2651,22 +2651,28 @@ double GetExteriorReflectionCaptureDistance() {
 }
 
 rex::system::IGraphicsSystem* GetNativeGraphicsSystem() {
-#if REX_PLATFORM_PS5
-  // [ps5 port] Asked several times per draw; the graphics system lives as long
-  // as the game does here (the app ends with the process), so look it up once.
-  static std::atomic<rex::system::IGraphicsSystem*> cached{nullptr};
-  if (auto* graphics = cached.load(std::memory_order_acquire)) return graphics;
-#endif
   auto* runtime = rex::Runtime::instance();
   if (!runtime) {
     return nullptr;
   }
+#if REX_PLATFORM_PS5
+  // [ps5 port] Asked several times per draw, so look it up once per session.
+  // Returning to the hub destroys the graphics system and installs a new one
+  // for the next title, so the cache is keyed to the runtime's generation.
+  static std::atomic<uint64_t> cached_generation{0};
+  static std::atomic<rex::system::IGraphicsSystem*> cached{nullptr};
+  const uint64_t generation = rex::Runtime::graphics_generation();
+  if (cached_generation.load(std::memory_order_acquire) == generation) {
+    if (auto* graphics = cached.load(std::memory_order_relaxed)) return graphics;
+  }
+#endif
   auto* graphics = runtime->graphics_system();
   if (!graphics || graphics->GetTitleCommandAbi(kTitleId) != kTitleCommandAbi) {
     return nullptr;
   }
 #if REX_PLATFORM_PS5
-  cached.store(graphics, std::memory_order_release);
+  cached.store(graphics, std::memory_order_relaxed);
+  cached_generation.store(generation, std::memory_order_release);
 #endif
   return graphics;
 }

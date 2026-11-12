@@ -12,6 +12,8 @@
 
 #pragma once
 
+#include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -53,6 +55,7 @@ class ExportResolver;
 namespace system {
 class KernelState;
 class XThread;
+struct ShutdownReport;
 }  // namespace system
 namespace ui {
 class WindowedAppContext;
@@ -118,6 +121,11 @@ class Runtime {
   // Global instance accessor - set after Setup() is called
   static Runtime* instance();
 
+  // Monotonic stamp for the graphics system's lifetime. It changes whenever a
+  // graphics system is installed or destroyed, so a caller may cache the
+  // system for the current generation only; a return to the hub replaces it.
+  static uint64_t graphics_generation();
+
   // Subsystem accessors
   memory::Memory* memory() const { return memory_.get(); }
   rex::filesystem::VirtualFileSystem* file_system() const { return file_system_.get(); }
@@ -176,6 +184,30 @@ class Runtime {
 
   void Shutdown();
 
+  // Cooperative teardown for an in-process title transition.
+  //
+  // Closes save admission, drains guest threads cooperatively (never
+  // force-kills one), closes and flushes idle saved-game mounts, waits for
+  // save quiescence, and destroys runtime resources only when both phases
+  // proved clean. Otherwise it returns a blocked report and leaves every
+  // resource the surviving guest or the incomplete save could touch intact;
+  // the caller may retry. Never replace this with a process exit.
+  //
+  // Once begun the transition is committed: guest dispatch admission and save
+  // admission stay closed even on a blocked result, so a caller must retry or
+  // stop, never resume gameplay from a partially shut-down runtime. Calling
+  // from a guest thread is refused (blocked) because teardown would destroy the
+  // state the calling thread executes on.
+  //
+  // before_shutdown (optional) runs on the calling thread after the drain and
+  // the save barrier proved clean, immediately before resources are destroyed.
+  // It lets the host detach presentation objects that still point at the
+  // graphics system; it never runs on a blocked result.
+  system::ShutdownReport ShutdownCooperatively(
+      uint32_t guest_timeout_ms = 1000,
+      std::chrono::milliseconds save_timeout = std::chrono::milliseconds(5000),
+      std::function<void()> before_shutdown = {});
+
   // Load XEX image into guest memory
   X_STATUS LoadXexImage(const std::string_view module_path);
 
@@ -189,6 +221,11 @@ class Runtime {
 
   // Access the memory base pointer for recompiled code
   uint8_t* virtual_membase() const;
+
+  // Failed release retains the memory owner and blocks replacement sessions.
+  bool last_shutdown_released_everything() const {
+    return last_shutdown_released_everything_;
+  }
 
  private:
   // Set up VFS: mounts game_data_root as game:/d:, update_data_root as update:
@@ -208,6 +245,7 @@ class Runtime {
   ui::ImGuiDrawer* imgui_drawer_ = nullptr;
   bool tool_mode_ = false;
   bool setup_complete_ = false;
+  bool last_shutdown_released_everything_ = true;
 
   std::unique_ptr<memory::Memory> memory_;
   std::unique_ptr<runtime::FunctionDispatcher> function_dispatcher_;

@@ -23,6 +23,7 @@
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/rtl.h>
+#include <rex/kernel/xboxkrnl/vdhsio_watch.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
@@ -521,7 +522,7 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
 }
 
 void RegisterVideoExports(rex::runtime::ExportResolver* export_resolver,
-                          KernelState* kernel_state) {
+                          KernelState* kernel_state, VdHsioLockWatcher* hsio_watch) {
   auto memory = kernel_state->memory();
 
   // VdGlobalDevice (4b)
@@ -554,20 +555,16 @@ void RegisterVideoExports(rex::runtime::ExportResolver* export_resolver,
   // found blocked on a lock whose memory looks wiped. Log when it changes.
   REXLOG_INFO("ps5 diag: VdHSIOCalibrationLock at {:08X} (host {})", pVdHSIOCalibrationLock,
               static_cast<void*>(hsio_lock));
-  std::thread([p = reinterpret_cast<volatile uint8_t*>(hsio_lock), guest = pVdHSIOCalibrationLock] {
-    uint8_t last0 = 1, last1 = 40;  // (what RtlInitializeCriticalSectionAndSpinCount(10000) wrote)
-    for (int changes = 0; changes < 8;) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      uint8_t b0 = p[0], b1 = p[1];
-      if (b0 != last0 || b1 != last1) {
-        REXLOG_INFO("ps5 diag: VdHSIOCalibrationLock {:08X} header changed: type {} -> {}, spin {} -> {}; bytes 8-15 {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X}",
-                    guest, last0, b0, last1, b1, p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
-        last0 = b0;
-        last1 = b1;
-        ++changes;
-      }
-    }
-  }).detach();
+  if (hsio_watch) {
+    hsio_watch->Start(
+        pVdHSIOCalibrationLock, reinterpret_cast<const volatile uint8_t*>(hsio_lock),
+        [](uint32_t guest, uint8_t old_type, uint8_t new_type, uint8_t old_spin,
+           uint8_t new_spin, const uint8_t* raw) {
+          REXLOG_INFO("ps5 diag: VdHSIOCalibrationLock {:08X} header changed: type {} -> {}, spin {} -> {}; bytes 8-15 {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X}",
+                      guest, old_type, new_type, old_spin, new_spin, raw[0], raw[1], raw[2],
+                      raw[3], raw[4], raw[5], raw[6], raw[7]);
+        });
+  }
 #endif
 }
 

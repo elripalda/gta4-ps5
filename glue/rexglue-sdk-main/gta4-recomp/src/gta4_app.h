@@ -57,7 +57,19 @@ class GTA4App final : public rex::ReXApp {
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override;
   bool RequiresSynchronizedInitialThreadResume() const override;
   void OnShutdown() override;
+  // F02: called when a return to the hub ends this session (the drain and save
+  // barrier already proved clean) and before the presentation is released.
+  void OnSessionEnding() override;
+  void OnPresentationTeardown() override;
   bool OnWindowCloseRequested() override;
+
+  // F02 Return to Hub: start the restart, then show the hub again and launch
+  // the next session from it.
+  void RequestReturnToHub();
+  void ShowHubForNextSession();
+  void StartSessionFromHub();
+  void OnSessionReturnFinished(bool succeeded);
+
   void QueueAchievementUpload(uint32_t achievement_id);
   void AchievementSyncWorkerMain();
   void TitleProfileSyncWorkerMain();
@@ -110,6 +122,9 @@ class GTA4App final : public rex::ReXApp {
   std::thread title_profile_sync_worker_;
   std::filesystem::path liberty_root_;
   std::filesystem::path native_config_path_;
+  // The hub's launch defaults, kept for the hub shown after a return.
+  rex::PathConfig hub_defaults_;
+  bool hub_defaults_valid_ = false;
   std::unique_ptr<gta4::input::UserMusicPlayer> user_music_player_;
   std::unique_ptr<gta4::input::TextChatDialog> text_chat_dialog_;
   std::unique_ptr<gta4::input::ContextTouchOverlay> context_touch_overlay_;

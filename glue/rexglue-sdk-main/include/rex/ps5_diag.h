@@ -5,7 +5,9 @@
  * black screen shows which stage stopped moving. Cheap relaxed atomics.
  */
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <sched.h>
 
 namespace rex::ps5diag {
 enum Counter : int {
@@ -45,6 +47,45 @@ extern WaitSlot wait_slots[kWaitSlots];
 WaitSlot* CurrentWaitSlot();  // (nullptr when out of slots)
 uint64_t NowMs();
 const char* ObjectTypeName(uint32_t type);
+
+// Never scan beyond the interrupted stack pointer's mapped page.
+inline uintptr_t StackScanEnd(uintptr_t rsp, size_t bytes) {
+  constexpr uintptr_t page_size = 4096;
+  const uintptr_t remaining = page_size - (rsp & (page_size - 1));
+  return rsp + (bytes < remaining ? bytes : remaining);
+}
+
+struct StackSampleGate {
+  std::atomic<bool> suspended{false};
+  std::atomic<int> readers{0};
+  bool Enter() {
+    readers.fetch_add(1, std::memory_order_seq_cst);
+    if (suspended.load(std::memory_order_seq_cst)) {
+      readers.fetch_sub(1, std::memory_order_seq_cst);
+      return false;
+    }
+    return true;
+  }
+  void Leave() { readers.fetch_sub(1, std::memory_order_seq_cst); }
+  void WaitForReaders() {
+    while (readers.load(std::memory_order_seq_cst)) sched_yield();
+  }
+};
+extern StackSampleGate stack_sample_gate;
+
+class RuntimeInspection {
+ public:
+  RuntimeInspection() : entered_(stack_sample_gate.Enter()) {}
+  ~RuntimeInspection() { if (entered_) stack_sample_gate.Leave(); }
+  RuntimeInspection(const RuntimeInspection&) = delete;
+  RuntimeInspection& operator=(const RuntimeInspection&) = delete;
+  explicit operator bool() const { return entered_; }
+ private:
+  bool entered_;
+};
+
+void SuspendStackSampling();
+void ResumeStackSampling();
 
 // Host stack samples: every rex thread registers itself; SampleAllThreads()
 // signals each one (SIGPROF), records its rip and the return-address-looking

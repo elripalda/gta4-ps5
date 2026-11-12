@@ -491,6 +491,26 @@ struct LoadFrame {
 thread_local LoadFrame* loading = nullptr;
 }  // namespace
 
+void ResetSession() {
+  std::scoped_lock lock(state_mutex, native_mutex, label_mutex);
+  world_epoch.fetch_add(1, std::memory_order_relaxed);
+  transaction.Reset();
+  installed = {};
+  program_addresses = {};
+  next_poll = 0;
+  request_thunk = 0;
+  observe_thunk = 0;
+  for (auto& native : natives)
+    native.handler = 0;
+  text_memory = nullptr;
+  text_pool = 0;
+  for (auto& text : texts) {
+    text.address = 0;
+    text.key_address = 0;
+  }
+  menu_trace_count.store(0, std::memory_order_relaxed);
+}
+
 void ObserveNativeRegistration(PPCContext& context, uint8_t* base) {
   const auto name = String(base, context.r3.u32);
   if (name.empty())

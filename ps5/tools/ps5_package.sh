@@ -18,6 +18,15 @@ title_id=${3:-PPSA94004}
 ps5dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 
 sdk_root=${PS5_PAYLOAD_SDK:-$tri/.deps/native/ps5-payload-sdk}
+python3 "$ps5dir/tools/prepare_f02_sdk.py" --verify "$sdk_root"
+python3 - "$build/CMakeCache.txt" "$sdk_root" <<'PY'
+import pathlib
+import sys
+cache = pathlib.Path(sys.argv[1]).read_text().splitlines()
+configured = next(line.split("=", 1)[1] for line in cache if line.startswith("PS5_PAYLOAD_SDK:"))
+if pathlib.Path(configured).resolve() != pathlib.Path(sys.argv[2]).resolve():
+    raise SystemExit("Packaging SDK differs from the configured build SDK")
+PY
 radv_archive=${RADV_ARCHIVE:-$tri/.deps/native/radv-release/lib/libvulkan_radeon.ps5.a}
 tool=$tri/build/host/ps5-native-tool
 for f in "$sdk_root/bin/prospero-lld" "$radv_archive" "$tool" "$tri/build/obj/app_crt.o" \

@@ -194,6 +194,17 @@ void RegisterBind(std::string_view name, std::string_view default_key, std::stri
                   std::function<void()> callback) {
   std::lock_guard lock(g_binds_mutex);
 
+  /* Re-registering a known bind (an in-process session restart rebuilds the
+     dialogs) revives the existing entry. The CVAR still points at this entry's
+     key string, and a user-rebound key must survive, so only the callback is
+     replaced. A duplicate CVAR registration would be ignored anyway. */
+  for (auto& existing : g_binds) {
+    if (existing.name == name) {
+      existing.callback = std::move(callback);
+      return;
+    }
+  }
+
   /* Store the bind entry (owns the key string that the CVAR references). */
   auto& entry = g_binds.emplace_back();
   entry.name = std::string(name);

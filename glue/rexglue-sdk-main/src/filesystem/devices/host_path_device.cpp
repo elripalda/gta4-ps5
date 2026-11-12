@@ -23,13 +23,18 @@ namespace rex::filesystem {
 
 HostPathDevice::HostPathDevice(const std::string_view mount_path,
                                const std::filesystem::path& host_path, bool read_only,
-                               bool allow_share_delete, bool trace_io)
+                               bool allow_share_delete, bool trace_io, bool save_data)
     : Device(mount_path),
       name_("STFS"),
       host_path_(host_path),
       read_only_(read_only),
       allow_share_delete_(allow_share_delete),
-      trace_io_(trace_io) {}
+      trace_io_(trace_io),
+      save_data_(save_data) {
+  if (save_data_) {
+    write_tracker_ = std::make_shared<WriteActivityTracker>();
+  }
+}
 
 HostPathDevice::~HostPathDevice() = default;
 

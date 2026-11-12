@@ -85,6 +85,11 @@ struct Budget {
   std::mutex mutex;
   std::unordered_set<std::string> seen;
   bool exhausted = false;
+  void Reset() {
+    std::lock_guard lock(mutex);
+    seen.clear();
+    exhausted = false;
+  }
   bool Take(std::string key, size_t limit, const char* point) {
     std::lock_guard lock(mutex);
     if (seen.contains(key))
@@ -197,6 +202,13 @@ struct GlyphScope {
   ~GlyphScope() { active_glyph = previous; }
 };
 }  // namespace
+
+void GTA4_FontSelectionTraceResetSession() {
+  texts.Reset();
+  glyphs.Reset();
+  bindings.Reset();
+  selections.Reset();
+}
 
 void GTA4_FontSelectionTraceText(const PPCContext& ctx, uint8_t* base) {
   if (!Enabled())

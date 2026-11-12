@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <string>
 
@@ -330,6 +331,15 @@ class XThread : public XObject {
   bool main_thread() const { return main_thread_; }
   bool is_running() const { return running_; }
 
+  // True once the host thread has begun executing the guest/host function.
+  // A thread that was created suspended and never resumed never starts.
+  bool has_started() const { return started_.load(std::memory_order_acquire); }
+
+  // Exit requested; the host stack may still be unwinding. Join before teardown.
+  bool host_exited() const {
+    return host_exited_ && host_exited_->load(std::memory_order_acquire);
+  }
+
   uint32_t thread_id() const { return thread_id_; }
   uint32_t last_error();
   void set_last_error(uint32_t error_code);
@@ -425,6 +435,11 @@ class XThread : public XObject {
   // Atomic: written by the thread itself in Exit/Terminate, read cross-thread by
   // KernelState::TerminateTitle's cooperative drain.
   std::atomic<bool> running_{false};
+  std::atomic<bool> started_{false};
+  // Shared with the host-thread lambda so the signal survives object
+  // destruction (ReleaseHandle may delete the XThread before the lambda ends).
+  std::shared_ptr<std::atomic<bool>> host_exited_ =
+      std::make_shared<std::atomic<bool>>(false);
 
   std::string thread_name_;
   std::unique_ptr<runtime::ThreadState> thread_state_;
