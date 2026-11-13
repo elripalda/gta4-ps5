@@ -54737,7 +54737,7 @@ DEFINE_REX_FUNC(sub_8227F2E8) {
 	// lis r11,-32256
 	ctx.r11.s64 = -2113929216;
 	// lwz r9,0(r30)
-	ctx.r9.u64 = REX_LOAD_U32(r30.u32 + 0);
+	ctx.r9.u64 = r30.u64; // [uaf-fix] slot holds the colour value now
 	// fmr f6,f29
 	ctx.f6.f64 = f29.f64;
 	// fmr f1,f28
@@ -54794,7 +54794,7 @@ DEFINE_REX_FUNC(sub_8227F2E8) {
 		ctx.f31 = s_f31;
 	}
 	// lwz r9,0(r30)
-	ctx.r9.u64 = REX_LOAD_U32(r30.u32 + 0);
+	ctx.r9.u64 = r30.u64; // [uaf-fix] slot holds the colour value now
 	// fmr f8,f21
 	ctx.fpscr.disableFlushMode();
 	ctx.f8.f64 = f21.f64;
@@ -54857,7 +54857,7 @@ DEFINE_REX_FUNC(sub_8227F2E8) {
 		ctx.f31 = s_f31;
 	}
 	// lwz r9,0(r30)
-	ctx.r9.u64 = REX_LOAD_U32(r30.u32 + 0);
+	ctx.r9.u64 = r30.u64; // [uaf-fix] slot holds the colour value now
 	// fmr f8,f23
 	ctx.fpscr.disableFlushMode();
 	ctx.f8.f64 = f23.f64;
@@ -54920,7 +54920,7 @@ DEFINE_REX_FUNC(sub_8227F2E8) {
 		ctx.f31 = s_f31;
 	}
 	// lwz r9,0(r30)
-	ctx.r9.u64 = REX_LOAD_U32(r30.u32 + 0);
+	ctx.r9.u64 = r30.u64; // [uaf-fix] slot holds the colour value now
 	// fmr f8,f21
 	ctx.fpscr.disableFlushMode();
 	ctx.f8.f64 = f21.f64;
@@ -55409,7 +55409,9 @@ DEFINE_REX_FUNC(sub_8227F5B8) {
 	temp.u32 = REX_LOAD_U32(ctx.r3.u32 + 8);
 	ctx.f3.f64 = double(temp.f32);
 	// stw r4,92(r1)
-	REX_STORE_U32(ctx.r1.u32 + 92, ctx.r4.u32);
+	// [uaf-fix] copy-at-enqueue: spill the colour VALUE, not the pointer
+	ctx.r9.u64 = REX_LOAD_U32(ctx.r4.u32 + 0);
+	REX_STORE_U32(ctx.r1.u32 + 92, ctx.r9.u32);
 	// lfs f2,4(r3)
 	temp.u32 = REX_LOAD_U32(ctx.r3.u32 + 4);
 	ctx.f2.f64 = double(temp.f32);
@@ -55465,7 +55467,9 @@ DEFINE_REX_FUNC(sub_8227F608) {
 	temp.u32 = REX_LOAD_U32(ctx.r4.u32 + 8);
 	ctx.f8.f64 = double(temp.f32);
 	// stw r5,92(r1)
-	REX_STORE_U32(ctx.r1.u32 + 92, ctx.r5.u32);
+	// [uaf-fix] copy-at-enqueue: spill the colour VALUE, not the pointer
+	ctx.r9.u64 = REX_LOAD_U32(ctx.r5.u32 + 0);
+	REX_STORE_U32(ctx.r1.u32 + 92, ctx.r9.u32);
 	// lfs f7,4(r4)
 	temp.u32 = REX_LOAD_U32(ctx.r4.u32 + 4);
 	ctx.f7.f64 = double(temp.f32);
