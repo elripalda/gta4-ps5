@@ -586,8 +586,16 @@ object_ref<XThread> KernelState::PrepareModuleLaunch(object_ref<UserModule> modu
 
   // Create a thread to run in.
   // We start suspended so the caller can inspect/attach before resume.
+  // [stack-fix] GTA IV's XEX declares a small main-thread stack that the
+  // player-info/audio recursion path (RunPrimaryPlayerInfoAlias et al.) can
+  // exhaust after minutes of play -> guest stack guard-page SIGSEGV. Clamp the
+  // main XThread's guest stack to at least 8 MiB (Xenia-style limit raise).
+  uint32_t main_stack_size = module->stack_size();
+  if (main_stack_size < (8u << 20)) {
+    main_stack_size = 8u << 20;
+  }
   auto thread = object_ref<XThread>(new XThread(
-      this, module->stack_size(), 0, module->entry_point(), 0, X_CREATE_SUSPENDED, true, true));
+      this, main_stack_size, 0, module->entry_point(), 0, X_CREATE_SUSPENDED, true, true));
 
   // We know this is the 'main thread'.
   thread->set_name("Main XThread");
