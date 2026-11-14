@@ -47,6 +47,7 @@ set(GTA4_APP_SOURCES
     src/install/gta4_rpf_extractor.cpp
     src/install/gta4_source_inspector.cpp
     src/legal_screen_trace.cpp
+    src/frontend_controller_patch.cpp
     src/rpf_button_prompts.cpp
     src/input/text_chat_dialog.cpp
     src/input/context_touch_controls.cpp
