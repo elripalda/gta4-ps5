@@ -5,8 +5,10 @@ screen. It replaces only the `pack:/controller.dds` surface inside a
 user-owned `frontend.xtd` dictionary and leaves every other texture, label and
 button mapping byte-identical.
 
-This directory contains no game data or artwork. You must supply your own
-installed game files and a correctly formatted controller DDS.
+This directory contains no game data. You must supply your own installed game
+files. A redistributable 512×512 DXT5 controller diagram and its generator are
+provided in [`artwork/`](artwork/README.md); the third-party artwork used for
+the byte-pinned vectors is not distributed.
 
 ## What it supports
 
@@ -44,6 +46,8 @@ cmake --build build-frontend-tool
 
 - A stock, user-owned `frontend.xtd` from your installation.
 - `controller_512.dds`: 512×512, single mip, DXT5, 262,144-byte payload.
+- Alternatively use `artwork/dualsense_controller_512.dds`: it meets the same
+  format requirements but is not the byte-pinned artwork.
 - The verified stock dictionaries are pinned by SHA-256; unknown files are
   refused unless you pass `--allow-unknown-input` (see `known`).
 
@@ -121,7 +125,12 @@ accepted outputs byte-for-byte:
 
 The verified artwork hash is
 `f844b50a5101d147ecd9b2b6b7933eb8313a3473cceee726ec0fefbb4c71048b`. That DDS
-is **not** distributed here; its redistribution rights are unresolved.
+is **not** distributed here; its redistribution rights are unresolved. It is a
+512×512 derivative of the upstream FusionFix
+`textures/pc/textures/buttons_360.wtd/ps5_controller.dds`
+(SHA-256 `26aea8c483a87f1a476659fd4da7ae47bc5162f982019bc2bc801cbbdd524e18`).
+See [`artwork/README.md`](artwork/README.md) for the upstream link, the bundled
+GPL-3.0-or-later alternative and its validation hashes.
 
 ## Limitations
 
@@ -140,8 +149,10 @@ is **not** distributed here; its redistribution rights are unresolved.
 
 ## Licensing
 
-- No Rockstar game data, generated archives, keys, or third-party artwork are
-  included in this directory.
+- No Rockstar game data, generated archives, keys, or unresolved third-party
+  artwork are included in this directory.
 - The verified artwork used for the accepted build is a FusionFix-derived
   asset (GPL-3.0, original artist unverified) and is not redistributed.
+- `artwork/` contains an independently authored diagram and generator, licensed
+  GPL-3.0-or-later. See [`artwork/README.md`](artwork/README.md).
 - This code is part of the GPL-3.0 repository.
