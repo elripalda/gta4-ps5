@@ -33,6 +33,7 @@ namespace {
 constexpr int32_t kSystemUser = 0xFF;
 constexpr int32_t kPortTypeMain = 0;
 constexpr uint32_t kFormatS16Stereo = 1;
+constexpr uint32_t kFormatS16_8CH = 2;
 }  // namespace
 
 Ps5AudioDriver::Ps5AudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore)
@@ -44,13 +45,22 @@ bool Ps5AudioDriver::Initialize() {
   int32_t rc = sceAudioOutInit();
   // (Already initialized by someone else in the process is fine.)
   (void)rc;
+  output_channels_ = kSurroundOutputChannels;
   port_ = sceAudioOutOpen(kSystemUser, kPortTypeMain, 0, kChannelSamples, kFrequency,
-                          kFormatS16Stereo);
+                          kFormatS16_8CH);
+  if (port_ < 0) {
+    REXAPU_WARN("PS5 audio: 8ch sceAudioOutOpen failed ({:#x}); falling back to stereo",
+                uint32_t(port_));
+    output_channels_ = kStereoOutputChannels;
+    port_ = sceAudioOutOpen(kSystemUser, kPortTypeMain, 0, kChannelSamples, kFrequency,
+                            kFormatS16Stereo);
+  }
   if (port_ < 0) {
     REXAPU_ERROR("PS5 audio: sceAudioOutOpen failed ({:#x})", uint32_t(port_));
     return false;
   }
-  REXAPU_INFO("PS5 audio: port {} (48000 Hz, 256-sample frames, s16 stereo)", port_);
+  REXAPU_INFO("PS5 audio: port {} (48000 Hz, 256-sample frames, s16 {}ch)", port_,
+              output_channels_);
   running_ = true;
   thread_ = std::thread([this] { OutputThread(); });
   return true;
@@ -85,8 +95,9 @@ void Ps5AudioDriver::SubmitFrame(uint32_t frame_ptr) {
 // game frame when there is one (then the game may submit another: release
 // the semaphore), else silence.
 void Ps5AudioDriver::OutputThread() {
-  float stereo[kChannelSamples * 2];
-  int16_t pcm[kChannelSamples * 2];
+  float samples[kChannelSamples * kChannels];
+  int16_t pcm[kChannelSamples * kSurroundOutputChannels];
+  const size_t pcm_bytes = kChannelSamples * output_channels_ * sizeof(int16_t);
   // Gaps: the game's sound not there in time (silence played instead), while
   // it isn't paused. Logged every 10 s there were any (a shorter queue,
   // ps5_audio_frames, leaves less room for the game's threads to be late).
@@ -116,13 +127,30 @@ void Ps5AudioDriver::OutputThread() {
       gaps = silent = played = 0;
     }
     if (frame && !REXCVAR_GET(audio_mute)) {
-      conversion::sequential_6_BE_to_interleaved_2_LE(stereo, frame, kChannelSamples);
-      for (uint32_t i = 0; i < kChannelSamples * 2; ++i) {
-        float s = std::clamp(stereo[i], -1.0f, 1.0f);
-        pcm[i] = int16_t(s * 32767.0f);
+      if (output_channels_ == kSurroundOutputChannels) {
+        // Xbox 360 XAudio2 canonical 5.1 order is (FL, FR, FC, LFE, BL, BR).
+        // PS5 S16_8CH has 8 channels (FL, FR, FC, LFE, LS/BL, RS/BR, LRS/SL, RRS/SR);
+        // duplicate the 5.1 rear channels (4, 5) into channels (6, 7) so both
+        // side-surround and rear-back beds in 5.1 / 7.1 / Dolby Atmos receive them.
+        conversion::sequential_6_BE_to_interleaved_6_LE(samples, frame, kChannelSamples);
+        for (uint32_t s = 0; s < kChannelSamples; ++s) {
+          const float* in = &samples[s * kChannels];
+          int16_t* out = &pcm[s * kSurroundOutputChannels];
+          for (uint32_t c = 0; c < kChannels; ++c) {
+            out[c] = int16_t(std::clamp(in[c], -1.0f, 1.0f) * 32767.0f);
+          }
+          out[6] = out[4];
+          out[7] = out[5];
+        }
+      } else {
+        conversion::sequential_6_BE_to_interleaved_2_LE(samples, frame, kChannelSamples);
+        for (uint32_t i = 0; i < kChannelSamples * kStereoOutputChannels; ++i) {
+          float s = std::clamp(samples[i], -1.0f, 1.0f);
+          pcm[i] = int16_t(s * 32767.0f);
+        }
       }
     } else {
-      std::memset(pcm, 0, sizeof(pcm));
+      std::memset(pcm, 0, pcm_bytes);
     }
     if (frame) {
       {
