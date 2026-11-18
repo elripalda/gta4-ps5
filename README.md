@@ -23,6 +23,7 @@ The easiest way to play is **[RecompStore](https://recompstore.com)**. It instal
 - Installs the game and the episodes from your own files, imports your Xbox 360 saves, and backs up and restores saves
 - Display presets: Recommended, Performance and Quality, all at 60 FPS
 - Graphics settings: resolution, draw distance, city population, anti-aliasing, texture filtering, shadows, reflections, motion blur, film grain and FusionFix's enhanced effects
+- Custom high-resolution texture packs (`<xxh64>.dds` in `textures/`), plus an on-console converter in Display -> Import Texture Mods for PC GTA IV mods (`.oiv`, `.zip`, `.img`, `.rpf`, `.wtd`, `.dds`, or folders)
 - Centered car camera, and how quickly the car camera returns and follows
 - An FPS counter (simple or detailed), off by default
 - English, French, German, Spanish and Italian

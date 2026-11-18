@@ -174,6 +174,14 @@ static const std::vector<Hub::Setting>& Settings() {
        "Keeps textures seen at an angle sharp, like roads and pavements going into the distance. Original is "
        "the Xbox 360's; 16x is the sharpest and costs very little.",
        true, {"1x", "4x", "8x", "16x"}, {"Original", "4x", "8x", "16x"}, "1x"},
+      {"DISPLAY", "gta4_native_texture_packs", "Custom Textures", nullptr,
+       "Loads high-resolution <hash>.dds texture packs from /data/homebrew/PPSA94004/textures/. "
+       "Takes effect on launch.",
+       true, {"true", "false"}, {"On", "Off"}, "true"},
+      {"DISPLAY", "ps5_import_texture_mods", "Import Texture Mods", nullptr,
+       "Converts PC GTA IV texture mods (.oiv, .zip, .img, .rpf, .wtd, .dds, or folders) from "
+       "mods/ into 2048px-capped PS5 packs under textures/.",
+       false, {""}, {""}, ""},
       // (FusionFix's shaders, built in: LibertyRecompLib/shader_overrides)
       {"DISPLAY", "gta4_modern_shaders", "Enhanced Effects", nullptr,
        "The shaders from FusionFix, the PC mod: depth of field, a better sky, bloom and fog, and nicer water "
@@ -306,6 +314,10 @@ static const std::vector<Hub::Setting>& Settings() {
        "Re-reads textures that change in memory without the game saying so. Off brings back the wrong map and "
        "radar tiles. Only for comparing performance.",
        false, {"true", "false"}, {"On", "Off"}, "true"},
+      {"DEBUG", "gta4_native_texture_dump", "Dump Textures", nullptr,
+       "Writes captured Xbox 360 textures as <hash>.dds into /data/homebrew/PPSA94004/textures_dump/ "
+       "for authoring custom texture packs. Leaves many files; turn off when done.",
+       false, {"true", "false"}, {"On", "Off"}, "false"},
       // (gta4_native_hooks.cpp: Ps5LimitFrameRate)
       {"DEBUG", "ps5_cutscene_30", "Cutscenes at 30", nullptr,
        "Holds the game at 30 FPS during cutscenes and loading screens, as on the Xbox 360. Off plays them at "
@@ -353,6 +365,7 @@ void Hub::Load() {
   if (Value("hub_debug_options", "false") != "false") Save("hub_debug_options", "false");
   KeepHiddenSettings();
   LoadSaves();
+  RefreshPendingTextureMods();
   // (no Trophies tab since 1.1: not loaded)
   // (the game's files come from Recomp Store: only whether they're there)
   state_ = install::Look(paths_.app);
@@ -1166,7 +1179,7 @@ float Hub::ToastShown() const {
 
 void Hub::DrawHints() {
   float r = kPageR;
-  if (confirm_) return;  // (the question has its own, under it)
+  if (confirm_ || tex_importing_) return;  // (the modal has its own)
   if (installer_) {
     InstallerHints(r);
   } else {
@@ -1177,12 +1190,17 @@ void Hub::DrawHints() {
         break;
       case kDisplayTab:
       case kGameTab:
-      case kDebugTab:
+      case kDebugTab: {
         r = Hint(r, kCircle, "Back");
         r = Hint(r, kTriangle, "Reset All");
-        r = Hint(r, kLeft | kRight, "Adjust");
+        const auto on = SettingsOn(tab_);
+        const bool is_import_row =
+            item_[tab_] >= 0 && item_[tab_] < int(on.size()) &&
+            std::string_view(Settings()[size_t(on[size_t(item_[tab_])])].key) == "ps5_import_texture_mods";
+        r = Hint(r, is_import_row ? kCross : (kLeft | kRight), is_import_row ? "Import" : "Adjust");
         r = Hint(r, kUp | kDown, "Move");
         break;
+      }
       case kSavesTab:
         r = Hint(r, kCircle, "Back");
         if (item_[tab_] <= int(backups_.size()))
@@ -1258,6 +1276,94 @@ void Hub::DrawConfirm() {
     TextMid(Regular(), kSize, x, y + 16, pal_.hint, c.text, 0, kSpacing);
     x += TextWidth(Regular(), kSize, c.text, kSpacing) + kBetween;
   }
+  Fade(v0, a);
+}
+
+void Hub::RefreshPendingTextureMods() {
+  if (!texture_mod_import_.pending || tex_mods_scan_.valid()) return;
+  tex_mods_scan_ = std::async(std::launch::async, [fn = texture_mod_import_.pending] { return fn(); });
+}
+
+void Hub::StartTextureModImport() {
+  if (tex_importing_ || !texture_mod_import_.run) return;
+  tex_import_cancel_.store(false);
+  {
+    std::lock_guard<std::mutex> lock(tex_import_mutex_);
+    tex_import_phase_ = T("Starting texture mod import...");
+    tex_import_detail_.clear();
+    tex_import_done_ = 0;
+    tex_import_total_ = 0;
+  }
+  tex_importing_ = true;
+  tex_import_in_ = 0;
+  tex_import_future_ = std::async(std::launch::async, [this] {
+    return texture_mod_import_.run(
+        [this](const std::string& phase, const std::string& detail, int done, int total) {
+          std::lock_guard<std::mutex> lock(tex_import_mutex_);
+          tex_import_phase_ = phase;
+          tex_import_detail_ = detail;
+          tex_import_done_ = done;
+          tex_import_total_ = total;
+        },
+        &tex_import_cancel_);
+  });
+}
+
+void Hub::DrawTextureModImport() {
+  Ease(tex_import_in_, tex_importing_ ? 1.0f : 0.0f, 14);
+  if (!tex_importing_ && tex_import_in_ < 0.01f) return;
+  const float a = Smooth(tex_import_in_);
+  const ImVec2 size = ImGui::GetIO().DisplaySize;
+  dl_->AddRectFilled(ImVec2(0, 0), size, Black(0.97f * a));
+  const int v0 = dl_->VtxBuffer.Size;
+  const float cx = kW * 0.5f;
+
+  std::string phase, detail;
+  int done = 0, total = 0;
+  {
+    std::lock_guard<std::mutex> lock(tex_import_mutex_);
+    phase = tex_import_phase_;
+    detail = tex_import_detail_;
+    done = tex_import_done_;
+    total = tex_import_total_;
+  }
+  if (tex_import_cancel_.load()) {
+    phase = T("Cancelling...");
+  }
+
+  float y = kH * 0.5f - 140 + (1 - a) * 16;
+  TextMid(Bold(), 56, cx, y + 26, pal_.title, T("Importing Texture Mods"), 0.5f);
+  y += 88;
+  Spinner(cx, y, 22, pal_.focus);
+  y += 54;
+
+  const float bw = 720, bh = 12, bx = cx - bw * 0.5f;
+  Rect(bx, y, bw, bh, kBarBack);
+  if (total > 0) {
+    const float frac = std::clamp(float(done) / float(total), 0.0f, 1.0f);
+    if (frac > 0) Rect(bx, y, bw * frac, bh, pal_.focus);
+  } else {
+    const float span = bw * 0.28f;
+    const float t = std::fmod(time_ * 0.7f, 1.0f);
+    const float px = bx + (bw - span) * (0.5f - 0.5f * std::cos(t * 6.283185f));
+    Rect(px, y, span, bh, pal_.focus);
+  }
+  y += 38;
+
+  TextMid(Bold(), 31, cx, y, kText, Fit(Bold(), 31, phase, 1100), 0.5f);
+  y += 42;
+  if (!detail.empty()) {
+    TextMid(Regular(), 26, cx, y, kMenuGray, Fit(Regular(), 26, detail, 1100), 0.5f);
+  }
+  y += 58;
+
+  constexpr float kSize = 25, kButton = 33, kGap = 12, kSpacing = 0.8f;
+  const std::string cancel_text = Upper(T("Cancel"));
+  const float gw = GlyphWidth(kCircle, kButton);
+  const float total_w = gw + kGap + TextWidth(Regular(), kSize, cancel_text, kSpacing);
+  const float hx = cx - total_w * 0.5f;
+  Glyph(kCircle, hx + gw * 0.5f, y + 16, White(0.92f), kButton);
+  TextMid(Regular(), kSize, hx + gw + kGap, y + 16, pal_.hint, cancel_text, 0, kSpacing);
   Fade(v0, a);
 }
 
@@ -1668,6 +1774,14 @@ void Hub::DrawSettings() {
     const float room = kValueX - kListX - 28, lw = TextWidth(Bold(), kSize, label);
     TextMid(Bold(), lw > room ? std::max(24.0f, kSize * room / lw) : kSize, kListX, cy, col, label);
     const int idx = SettingIndex(r);
+    if (std::string_view(r.key) == "ps5_import_texture_mods") {
+      const std::string text = pending_texture_mods_
+                                   ? F(pending_texture_mods_ == 1 ? "{} waiting" : "{} waiting",
+                                       {std::to_string(pending_texture_mods_)})
+                                   : T("None waiting");
+      TextMid(Bold(), kSize, kValueX, cy, pending_texture_mods_ ? pal_.focus : col, text);
+      return;
+    }
     if (IsLevel(r)) {
       const float bw = 280, bh = 18, by = cy - bh * 0.5f;
       const float f = r.values.size() > 1 ? float(idx) / float(r.values.size() - 1) : 0;
@@ -1691,6 +1805,18 @@ void Hub::DrawSettings() {
                                                          : "120 Hz";
       TextMid(Bold(), 29, px, py + 18, kText, F("Right now: {}", {T(now)}));
       py += 44 + 20;
+    }
+    if (std::string_view(r.key) == "ps5_import_texture_mods") {
+      py += Wrapped(Regular(), 27, px, py, pw, kMenuGray,
+                    T("Copy PC texture mods (.oiv, .zip, .img, .rpf, .wtd, .dds, or folders) into:"),
+                    1.38f) +
+            16;
+      py += Wrapped(Bold(), 27, px, py, pw, pal_.title, "/data/homebrew/PPSA94004/mods/") + 20;
+      Wrapped(Regular(), 27, px, py, pw, kMenuGray,
+              T(pending_texture_mods_ ? "Press Cross to convert into PS5 <hash>.dds packs (max 2048px)."
+                                      : "Then press Cross here to convert them on PS5."),
+              1.38f);
+      return;
     }
     if (IsLevel(r) || r.labels.size() > 6) return;
     const int cur = SettingIndex(r);
@@ -1883,6 +2009,7 @@ bool Hub::Shown(const Setting& r) const {
 // are hidden again.
 void Hub::KeepHiddenSettings() {
   for (const Setting& r : Settings()) {
+    if (std::string_view(r.key) == "ps5_import_texture_mods") continue;
     if (Shown(r) || Value(r.key, r.fallback) == r.fallback) continue;
     Save(r.key, r.quoted ? std::string("\"") + r.fallback + "\"" : std::string(r.fallback));
     if (std::string_view(r.key) == "ps5_frame_generation") {
@@ -1935,6 +2062,7 @@ void Hub::ResetSettings() {
   for (const Setting& r : Settings()) {
     if (IsLanguage(r)) continue;  // (a choice, not a recommendation: it stays)
     if (IsPreset(r)) continue;    // (the rest's defaults are Recommended)
+    if (std::string_view(r.key) == "ps5_import_texture_mods") continue;
     Save(r.key, r.quoted ? std::string("\"") + r.fallback + "\"" : std::string(r.fallback));
   }
   // (what frame generation's setting sets with it: off)
@@ -1972,6 +2100,20 @@ void Hub::Activate(int dir) {
       const std::vector<int> on = SettingsOn(tab_);
       if (item < 0 || item >= int(on.size())) break;
       const auto& r = Settings()[size_t(on[size_t(item)])];
+      if (std::string_view(r.key) == "ps5_import_texture_mods") {
+        if (!texture_mod_import_.run) break;
+        const int waiting = texture_mod_import_.pending ? texture_mod_import_.pending() : pending_texture_mods_;
+        pending_texture_mods_ = waiting;
+        if (waiting == 0) {
+          Notice(T("Nothing to import"),
+                 T("Copy PC GTA IV texture mods (.oiv, .zip, .img, .rpf, .wtd, .dds, or folders) into "
+                   "/data/homebrew/PPSA94004/mods/ on the PS5, then press Cross here to convert them."));
+        } else {
+          Play(Sound::kSelect);
+          StartTextureModImport();
+        }
+        break;
+      }
       if (IsPreset(r)) {
         // Recommended, Performance and Quality in turn (Custom only shows)
         const int now = PresetNow();
@@ -2067,6 +2209,13 @@ void Hub::Activate(int dir) {
 void Hub::Navigate(const Pad& pad) {
   const uint32_t p = pad.pressed;
   if (leaving_) return;
+  if (tex_importing_) {
+    if ((p & kCircle) && tex_import_in_ > 0.4f && !tex_import_cancel_.load()) {
+      tex_import_cancel_.store(true);
+      Play(Sound::kBack);
+    }
+    return;
+  }
   if (confirm_) {  // a question: Cross does it, Circle doesn't (or does its own thing)
     if ((p & kCross) && confirm_in_ > 0.6f) {  // (not before it has been seen)
       auto action = std::move(confirm_);
@@ -2156,9 +2305,19 @@ void Hub::Navigate(const Pad& pad) {
                 T("Reset"), [this] { ResetSettings(); });
         return;
       }
-      if (p & kLeft) Activate(-1);
-      if (p & (kRight | kCross)) Activate(1);
-      if (p & (kLeft | kRight | kCross)) press_ = 0.6f;
+      {
+        const auto on = SettingsOn(tab_);
+        const bool is_import_row =
+            sel >= 0 && sel < int(on.size()) &&
+            std::string_view(Settings()[size_t(on[size_t(sel)])].key) == "ps5_import_texture_mods";
+        if (is_import_row) {
+          if (p & kCross) press_ = 1, Activate(0);
+        } else {
+          if (p & kLeft) Activate(-1);
+          if (p & (kRight | kCross)) Activate(1);
+          if (p & (kLeft | kRight | kCross)) press_ = 0.6f;
+        }
+      }
       break;
     case kSavesTab:
     case kEpisodesTab:
@@ -2179,6 +2338,7 @@ void Hub::GoTo(int tab, float dir) {
   panel_item_ = item_[tab_];
   // (what these pages show can change while the hub is open: looked at again)
   if (tab == kSavesTab) LoadSaves();
+  if (tab == kDisplayTab) RefreshPendingTextureMods();
   if (tab == kTrophiesTab) LoadTrophies();
   if (tab == kEpisodesTab) LookAgain();
 }
@@ -2199,6 +2359,19 @@ bool Hub::Draw(const Pad& pad, float dt) {
   }
   if (trophies_load_.valid() && trophies_load_.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
     TakeTrophies(trophies_load_.get());
+  if (tex_mods_scan_.valid() && tex_mods_scan_.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+    pending_texture_mods_ = tex_mods_scan_.get();
+  if (tex_importing_ && tex_import_future_.valid() &&
+      tex_import_future_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+    TextureModImportResultInfo res = tex_import_future_.get();
+    tex_importing_ = false;
+    RefreshPendingTextureMods();
+    if (res.count > 0 && Value("gta4_native_texture_packs", "true") != "true") {
+      Save("gta4_native_texture_packs", "true");
+    }
+    Play(res.count > 0 ? Sound::kSelect : Sound::kBack);
+    Notice(T("Texture Mods"), std::move(res.summary));
+  }
   pictures_this_frame_ = 0;
   dt_ = std::clamp(dt, 0.0f, 0.1f);
   time_ += dt_;
@@ -2251,6 +2424,7 @@ bool Hub::Draw(const Pad& pad, float dt) {
   Fade(first, Smooth(page_in_));
   DrawFooter();
   DrawHints();
+  DrawTextureModImport();
   DrawConfirm();
   // opening: up from black; PLAY: down to black
   const float open = Smooth(time_ / 0.7f);

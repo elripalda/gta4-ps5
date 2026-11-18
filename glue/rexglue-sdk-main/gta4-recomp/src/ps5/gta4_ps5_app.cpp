@@ -7,6 +7,7 @@
 #include <memory>
 #include <string>
 
+#include <fmt/format.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/runtime.h>
@@ -17,6 +18,7 @@
 #include "game/ps5_display.h"
 #include "game/ps5_overlay.h"
 #include "game/save_import.h"
+#include "game/texture_mod_import.h"
 #include "game/trophies_game.h"
 #include "hub/hub_lang.h"
 #include "hub/ps5_hub.h"
@@ -45,6 +47,8 @@ void ShowHub(rex::ui::ImGuiDrawer* drawer, rex::ui::ImmediateDrawer* immediate, 
   std::error_code ec;
   fs::create_directories(config.parent_path(), ec);
   fs::create_directories(SaveImportFolder(kApp), ec);
+  fs::create_directories(TextureModImportFolder(kApp), ec);
+  fs::create_directories(TexturePacksFolder(kApp), ec);
   hub::Paths hub_paths;
   hub_paths.app = kApp;
   hub_paths.config = config;
@@ -65,6 +69,36 @@ void ShowHub(rex::ui::ImGuiDrawer* drawer, rex::ui::ImmediateDrawer* immediate, 
                         if (r.errors.size() > 4) message += std::string("\n") + lang::T("...the log lists the rest.");
                         return message;
                       }});
+  hub::SetTextureModImport({
+      [] { return PendingTextureModImports(kApp); },
+      [liberty_root](std::function<void(const std::string& phase, const std::string& detail, int done, int total)> progress,
+                     const std::atomic<bool>* cancel) -> hub::Hub::TextureModImportResultInfo {
+        const TextureModImportResult r = ImportTextureMods(
+            kApp, liberty_root, kDefaultTextureModMaxSize,
+            [&](const TextureModProgress& p) {
+              if (progress) progress(p.phase, p.detail, p.done, p.total);
+            },
+            cancel);
+        const int total_tex = r.textures_converted + r.textures_copied_dds;
+        std::string message;
+        if (r.cancelled) {
+          message = "Cancelled. Any finished mods were saved to textures/; unfinished mods remain in mods/.";
+        } else if (total_tex > 0) {
+          message = fmt::format(
+              "Converted {} textures from {} {} (max {}px) into /data/homebrew/PPSA94004/textures/.\n"
+              "Moved imported files to mods/done/.",
+              total_tex, r.mods_processed, r.mods_processed == 1 ? "mod" : "mods", kDefaultTextureModMaxSize);
+          if (r.textures_skipped > 0) {
+            message += fmt::format("\n{} unmatched or ambiguous textures were skipped.", r.textures_skipped);
+          }
+          message += "\nCustom Textures is On — press Play to launch with the new pack.";
+        } else {
+          message = "No matching GTA IV textures were found to import.";
+        }
+        for (size_t i = 0; i < r.errors.size() && i < 4; ++i) message += "\n" + r.errors[i];
+        if (r.errors.size() > 4) message += "\n...the log lists the rest.";
+        return {total_tex, std::move(message)};
+      }});
   hub::SetDisplay({[] { return display::HighRefresh(); }, [](bool high) { return display::SetHighRefresh(high); },
                    [] { return display::Vrr(); }, [] { return display::Ready(); }});
   hub::Show(drawer, immediate, hub_paths, [config, launch = std::move(launch)] {

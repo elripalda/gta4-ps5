@@ -61,6 +61,8 @@ use the hub's usual type.
 
 - `install/`: your GTA IV disc image (USA, .iso) and Title Update 8. The game installs itself from them the first time.
 - `import/`: Xbox 360 save files, imported from the hub's Saves page.
+- `mods/`: PC GTA IV texture mods (`.oiv`, `.zip`, `.img`, `.rpf`, `.wtd`, `.dds`, or extracted folders), converted on-console from Display -> Import Texture Mods.
+- `textures/`: custom `<xxh64>.dds` texture packs (populated automatically by Import Texture Mods, or offline with `tools/convert_texture_mod.py`).
 - `logs/`: the log, and frame time captures when they're on.
 
 ## Where things are
@@ -68,8 +70,9 @@ use the hub's usual type.
 | | |
 |---|---|
 | `glue/rexglue-sdk-main/gta4-recomp/src/ps5/hub/` | the hub |
-| `glue/rexglue-sdk-main/gta4-recomp/src/ps5/game/` | trophies, the FPS counter, 360 save import, sound |
+| `glue/rexglue-sdk-main/gta4-recomp/src/ps5/game/` | trophies, the FPS counter, 360 save import, PC texture mod converter, sound |
 | `glue/rexglue-sdk-main/gta4-recomp/src/ps5/gta4_ps5_app.cpp` | where the game and the hub meet |
 | `ps5/payload/installer/` | the installer payload: the app sends it to the payload loader on port 9021 to install the game at full speed (built by `ps5_package.sh`) |
-| `ps5/package/` | home screen icon, hub art, each game's menu music and the menu sounds, the button pictures |
+| `ps5/package/` | home screen icon, hub art, each game's menu music and the menu sounds, the button pictures, folder READMEs |
 | `ps5/tools/` | packaging, the button pictures, the hub preview |
+| `tools/convert_texture_mod.py` | offline PC texture mod converter (`--xbox` + `--mod` -> `<xxh64>.dds`) |

@@ -77,6 +77,7 @@ struct PadData {
 
 Assets g_assets;
 Hub::SaveImport g_save_import;
+Hub::TextureModImport g_texture_mod_import;
 Hub::Display g_display;
 // The hub's pictures: kept for the app's life. (The dialog is deleted right
 // after the frame START GAME was pressed on, and that frame's draw list,
@@ -333,6 +334,7 @@ class HubDialog final : public rex::ui::ImGuiDialog {
       if (Image img = Load(immediate, hub / "buttons" / (std::string(n) + ".png"))) a.buttons[b] = img;
     hub_.SetImageLoader([this, immediate](const fs::path& file) { return Load(immediate, file); });
     hub_.SetSaveImport(g_save_import);
+    hub_.SetTextureModImport(g_texture_mod_import);
     hub_.SetDisplay(g_display);
     hub_.Init(paths, a, GTA4PS5_VERSION);
     StyleGameDialogs(a, hub);
@@ -446,6 +448,7 @@ void ConfigureFonts(ImFontAtlas* atlas) {
 const Assets& Fonts() { return g_assets; }
 
 void SetSaveImport(Hub::SaveImport import) { g_save_import = std::move(import); }
+void SetTextureModImport(Hub::TextureModImport import) { g_texture_mod_import = std::move(import); }
 void SetDisplay(Hub::Display display) { g_display = std::move(display); }
 
 const char* Version() { return GTA4PS5_VERSION; }
