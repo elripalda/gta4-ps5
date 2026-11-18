@@ -37,7 +37,7 @@ std::filesystem::path Hub::InstallRoot() const {
   return paths_.install.empty() ? paths_.app / "UserData" / "LibertyRecomp" : paths_.install;
 }
 
-bool Hub::Busy() const { return installer_ && job_phase_ == Phase::kInstalling; }
+bool Hub::Busy() const { return (installer_ && job_phase_ == Phase::kInstalling) || tex_importing_; }
 
 void Hub::OpenInstaller(int episode) {
   installer_ = true;

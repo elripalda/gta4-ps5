@@ -471,6 +471,7 @@ elseif(PS5)
         src/ps5/game/ps5_display.cpp
         src/ps5/game/ps5_overlay.cpp
         src/ps5/game/save_import.cpp
+        src/ps5/game/texture_mod_import.cpp
         src/ps5/game/memory_watch.cpp
         src/ps5/trophies_native/native_trophies.cpp
         # RecompTrophy's (GPL-3.0, by lamarking, used with permission): the

@@ -10,12 +10,14 @@
 // screen, reads the DualSense, plays the music and starts the game.
 #pragma once
 
+#include <atomic>
 #include <future>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -182,6 +184,20 @@ class Hub {
     std::function<std::string()> run;
   };
   void SetSaveImport(SaveImport import) { save_import_ = std::move(import); }
+  // Display page's PC texture mod converter: pending packs in mods/, and
+  // converting them asynchronously into textures/<mod>/<hash>.dds.
+  struct TextureModImportResultInfo {
+    int count = 0;
+    std::string summary;
+  };
+  struct TextureModImport {
+    std::function<int()> pending;
+    std::function<TextureModImportResultInfo(
+        std::function<void(const std::string& phase, const std::string& detail, int done, int total)> progress,
+        const std::atomic<bool>* cancel)>
+        run;
+  };
+  void SetTextureModImport(TextureModImport import) { texture_mod_import_ = std::move(import); }
   // Display's Refresh Rate, switched as soon as it's chosen: whether the TV is
   // at 120 Hz, and the switch (false: it stayed where it was).
   struct Display {
@@ -410,6 +426,21 @@ class Hub {
   std::vector<SaveItem> save_items_;
   SaveImport save_import_;
   int pending_imports_ = 0;
+  TextureModImport texture_mod_import_;
+  std::future<int> tex_mods_scan_;
+  int pending_texture_mods_ = 0;
+  bool tex_importing_ = false;
+  std::atomic<bool> tex_import_cancel_{false};
+  std::future<TextureModImportResultInfo> tex_import_future_;
+  std::mutex tex_import_mutex_;
+  std::string tex_import_phase_;
+  std::string tex_import_detail_;
+  int tex_import_done_ = 0;
+  int tex_import_total_ = 0;
+  float tex_import_in_ = 0;
+  void RefreshPendingTextureMods();
+  void StartTextureModImport();
+  void DrawTextureModImport();
   Display display_;
   // the game's files
   install::State state_;

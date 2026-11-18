@@ -692,6 +692,18 @@ REXCVAR_DEFINE_UINT32(
 REXCVAR_DEFINE_UINT32(
     gta4_native_texture_memory_limit_mb, 0, "GTA IV/Graphics/Native Renderer",
     "Optional native texture heap budget cap in MiB (0 uses the Vulkan driver budget)");
+REXCVAR_DEFINE_BOOL(
+    gta4_native_texture_packs, true, "GTA IV/Graphics/Native Renderer",
+    "Load custom <xxh64>.dds texture packs from the textures folder");
+REXCVAR_DEFINE_STRING(
+    gta4_native_texture_packs_dir, "", "GTA IV/Graphics/Native Renderer",
+    "Optional custom texture packs directory override");
+REXCVAR_DEFINE_BOOL(
+    gta4_native_texture_dump, false, "GTA IV/Graphics/Native Renderer",
+    "Dump captured Xbox 360 textures as <xxh64>.dds for texture pack authoring");
+REXCVAR_DEFINE_STRING(
+    gta4_native_texture_dump_dir, "", "GTA IV/Graphics/Native Renderer",
+    "Optional texture dump directory override");
 
 namespace rex::graphics::gta4_native {
 
@@ -4059,6 +4071,11 @@ X_STATUS Gta4NativeGraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* fu
         static_cast<ui::vulkan::VulkanProvider*>(provider_.get())->vulkan_device());
   }
 
+  custom_texture_pack_.Initialize(
+      static_cast<ui::vulkan::VulkanProvider*>(provider_.get())->vulkan_device(),
+      REXCVAR_GET(gta4_native_texture_packs), REXCVAR_GET(gta4_native_texture_packs_dir),
+      REXCVAR_GET(gta4_native_texture_dump), REXCVAR_GET(gta4_native_texture_dump_dir));
+
   StartRenderWorker();
   return X_STATUS_SUCCESS;
 }
@@ -6138,6 +6155,88 @@ namespace {
 // Set while a capture repeats itself on the CPU path after its GPU-detile
 // attempt could not describe a subresource.
 thread_local bool t_force_cpu_texture_detile = false;
+
+VkFormat VkFormatForRawGuestDump(xenos::TextureFormat base_format) {
+  switch (base_format) {
+    case xenos::TextureFormat::k_8:
+    case xenos::TextureFormat::k_DXT5A:
+      return base_format == xenos::TextureFormat::k_DXT5A ? VK_FORMAT_BC4_UNORM_BLOCK
+                                                          : VK_FORMAT_R8_UNORM;
+    case xenos::TextureFormat::k_8_8_8_8:
+      return VK_FORMAT_R8G8B8A8_UNORM;
+    case xenos::TextureFormat::k_DXT1:
+      return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+    case xenos::TextureFormat::k_DXT2_3:
+      return VK_FORMAT_BC2_UNORM_BLOCK;
+    case xenos::TextureFormat::k_DXT4_5:
+      return VK_FORMAT_BC3_UNORM_BLOCK;
+    case xenos::TextureFormat::k_DXN:
+      return VK_FORMAT_BC5_UNORM_BLOCK;
+    default:
+      return VK_FORMAT_UNDEFINED;
+  }
+}
+
+bool ExtractLinearMip0GuestBlocks(const ::rex::memory::Memory* memory, const TextureInfo& info,
+                                  const FormatInfo* guest_format_info,
+                                  uint32_t guest_bytes_per_block,
+                                  uint32_t guest_bytes_per_block_log2,
+                                  std::vector<uint8_t>& out) {
+  out.clear();
+  if (!memory || !guest_format_info || !guest_bytes_per_block) {
+    return false;
+  }
+  const uint32_t mip_width = info.width + 1;
+  const uint32_t mip_height = info.height + 1;
+  const TextureExtent guest_extent = info.GetMipExtent(0, true);
+  const TextureExtent linear_extent =
+      TextureExtent::Calculate(guest_format_info, mip_width, mip_height, 1, false, false);
+  const uint64_t linear_bytes =
+      uint64_t(linear_extent.visible_blocks()) * uint64_t(guest_bytes_per_block);
+  if (!linear_bytes || linear_bytes > 0x4000000ull) {
+    return false;
+  }
+  uint32_t packed_x = 0;
+  uint32_t packed_y = 0;
+  const uint32_t mip_address = info.GetMipLocation(0, &packed_x, &packed_y, true);
+  const uint64_t mip_phys_base = uint64_t(mip_address & 0x1FFFFFFFu);
+  const uint8_t* source = memory->TranslatePhysical<const uint8_t*>(mip_address);
+  if (!source) {
+    return false;
+  }
+  out.resize(static_cast<size_t>(linear_bytes), uint8_t{});
+  for (uint32_t block_y = 0; block_y < linear_extent.block_height; ++block_y) {
+    for (uint32_t block_x = 0; block_x < linear_extent.block_width; ++block_x) {
+      const uint32_t src_x = packed_x + block_x;
+      const uint32_t src_y = packed_y + block_y;
+      const int32_t src_offset =
+          info.is_tiled
+              ? texture_util::GetTiledOffset2D(int32_t(src_x), int32_t(src_y),
+                                                guest_extent.block_pitch_h,
+                                                guest_bytes_per_block_log2)
+              : int32_t((uint64_t(src_y) * guest_extent.block_pitch_h + src_x) *
+                        guest_bytes_per_block);
+      if (src_offset < 0 ||
+          mip_phys_base + uint64_t(src_offset) + guest_bytes_per_block > 0x20000000ull) {
+        out.clear();
+        return false;
+      }
+      const size_t dst_offset =
+          (size_t(block_y) * linear_extent.block_pitch_h + block_x) * guest_bytes_per_block;
+      if (dst_offset + guest_bytes_per_block > out.size()) {
+        out.clear();
+        return false;
+      }
+      if (guest_bytes_per_block == 1) {
+        out[dst_offset] = source[uint32_t(src_offset)];
+      } else {
+        texture_conversion::CopySwapBlock(info.endianness, out.data() + dst_offset,
+                                          source + uint32_t(src_offset), guest_bytes_per_block);
+      }
+    }
+  }
+  return true;
+}
 }  // namespace
 
 std::shared_ptr<const Gta4NativeGraphicsSystem::NativeTextureResource>
@@ -6778,6 +6877,72 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
     }
   }
   const bool wants_vector_font = vector_font != nullptr;
+  const uint64_t pack_generation = custom_texture_pack_.Generation();
+  const bool dump_enabled = custom_texture_pack_.DumpEnabled();
+  // When dumping is off and the pack index has not changed since a resource was
+  // captured, a match on fetch + full guest content hash + payload guarantees
+  // the same canonical pack lookup without untiling and re-hashing mip0 first.
+  if (!dump_enabled) {
+    std::lock_guard lock(texture_resource_mutex_);
+    auto existing = texture_resources_.find(handle);
+    if (existing != texture_resources_.end()) {
+      const auto& resource = existing->second;
+      if (resource && NativeTextureImageFetchEqual(resource->fetch, fetch) &&
+          resource->content_hash == content_hash &&
+          resource->vector_font_id == vector_font_id &&
+          resource->vector_font_replacement == wants_vector_font &&
+          resource->custom_texture_pack_generation == pack_generation &&
+          (resource->custom_texture_replacement ||
+           resource->detile_jobs.empty() == detile_jobs.empty()) &&
+          (resource->vector_font_replacement || resource->custom_texture_replacement ||
+           resource->payload == payload)) {
+        if (ShouldClearNativeTextureDirtyFlag(cache_entry_dirty, true)) {
+          dirty_texture_handles_.erase(handle);
+        }
+        return resource;
+      }
+    }
+  }
+  uint64_t mod_hash = 0;
+  bool has_mod_hash = false;
+  if (!wants_vector_font && custom_texture_pack_.NeedsCanonicalHash() &&
+      info.dimension == xenos::DataDimension::k2DOrStacked && !info.is_stacked &&
+      info.mip_min_level == 0 && !mip_levels.empty() &&
+      VkFormatForRawGuestDump(base_format) != VK_FORMAT_UNDEFINED) {
+    const bool payload_already_linear_mip0 =
+        !gpu_detile && !decode_dxt && base_format != xenos::TextureFormat::k_CTX1 &&
+        base_format != xenos::TextureFormat::k_DXN &&
+        base_format != xenos::TextureFormat::k_DXT5A &&
+        base_format != xenos::TextureFormat::k_DXT3A &&
+        mip_levels[0].payload_offset + mip_levels[0].payload_size <= payload.size();
+    thread_local std::vector<uint8_t> extracted_mip0;
+    std::span<const uint8_t> mip0_span;
+    if (payload_already_linear_mip0) {
+      mip0_span = std::span<const uint8_t>(payload.data() + mip_levels[0].payload_offset,
+                                           mip_levels[0].payload_size);
+    } else if (ExtractLinearMip0GuestBlocks(memory_, info, guest_format_info, guest_bytes_per_block,
+                                            guest_bytes_per_block_log2, extracted_mip0)) {
+      mip0_span = extracted_mip0;
+    }
+    if (!mip0_span.empty()) {
+      mod_hash = NativeTexturePack::ComputeCanonicalHash(info.width + 1, info.height + 1,
+                                                         uint32_t(base_format), mip0_span);
+      has_mod_hash = true;
+      if (dump_enabled) {
+        const VkFormat dump_format = VkFormatForRawGuestDump(base_format);
+        std::vector<uint8_t> dump_bytes(mip0_span.begin(), mip0_span.end());
+        TexturePackMipLevel dump_mip{};
+        dump_mip.level = 0;
+        dump_mip.width = info.width + 1;
+        dump_mip.height = info.height + 1;
+        dump_mip.payload_offset = 0;
+        dump_mip.payload_size = dump_bytes.size();
+        custom_texture_pack_.EnqueueDump(mod_hash, info.width + 1, info.height + 1, dump_format,
+                                         {dump_mip}, std::move(dump_bytes));
+      }
+    }
+  }
+  const bool has_custom_candidate = has_mod_hash && custom_texture_pack_.HasReplacement(mod_hash);
   std::lock_guard lock(texture_resource_mutex_);
   auto existing = texture_resources_.find(handle);
   if (existing != texture_resources_.end()) {
@@ -6786,14 +6951,23 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
         resource->content_hash == content_hash &&
         resource->vector_font_id == vector_font_id &&
         resource->vector_font_replacement == wants_vector_font &&
-        resource->detile_jobs.empty() == detile_jobs.empty() &&
-        (resource->vector_font_replacement || resource->payload == payload)) {
+        (!has_custom_candidate
+             ? !resource->custom_texture_replacement
+             : (resource->custom_texture_replacement &&
+                resource->custom_texture_hash == mod_hash)) &&
+        (has_custom_candidate || resource->detile_jobs.empty() == detile_jobs.empty()) &&
+        (resource->vector_font_replacement || resource->custom_texture_replacement ||
+         resource->payload == payload)) {
       if (ShouldClearNativeTextureDirtyFlag(cache_entry_dirty, true)) {
         dirty_texture_handles_.erase(handle);
       }
       return resource;
     }
   }
+
+  LoadedCustomTexture custom_texture;
+  const bool wants_custom_texture =
+      has_custom_candidate && custom_texture_pack_.TryLoadReplacement(mod_hash, custom_texture);
 
   auto resource = std::make_shared<NativeTextureResource>();
   resource->handle = handle;
@@ -6804,6 +6978,7 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
   resource->origin = NativeTextureOrigin::kGuestSnapshot;
   resource->virtual_lifetime = virtual_guest_lifetime;
   resource->vector_font_id = vector_font_id;
+  resource->custom_texture_pack_generation = pack_generation;
   if (vector_font) {
     const TextureInfo stock_info = resource->info;
     resource->info.format = xenos::TextureFormat::k_8;
@@ -6854,6 +7029,34 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
         content_hash, uint32_t(resource->info.format), resource->info.width + 1,
         resource->info.height + 1, resource->info.pitch, resource->mip_levels.size(),
         resource->payload.size(), replacement_hash);
+  } else if (wants_custom_texture) {
+    resource->info.width = custom_texture.width - 1;
+    resource->info.height = custom_texture.height - 1;
+    resource->info.depth = 0;
+    resource->info.mip_min_level = 0;
+    resource->info.mip_max_level = custom_texture.mip_count - 1;
+    resource->info.is_stacked = false;
+    resource->info.is_tiled = false;
+    resource->info.has_packed_mips = false;
+    resource->mod_vk_format = custom_texture.vk_format;
+    resource->custom_texture_replacement = true;
+    resource->custom_texture_hash = mod_hash;
+    resource->payload = std::move(custom_texture.payload);
+    resource->mip_levels.reserve(custom_texture.mip_levels.size());
+    for (const TexturePackMipLevel& src_mip : custom_texture.mip_levels) {
+      NativeTextureResource::MipLevel dst_mip{};
+      dst_mip.level = src_mip.level;
+      dst_mip.width = src_mip.width;
+      dst_mip.height = src_mip.height;
+      dst_mip.depth = 1;
+      dst_mip.base_array_layer = 0;
+      dst_mip.layer_count = 1;
+      dst_mip.buffer_row_length = src_mip.buffer_row_length;
+      dst_mip.buffer_image_height = src_mip.buffer_image_height;
+      dst_mip.payload_offset = src_mip.payload_offset;
+      dst_mip.payload_size = src_mip.payload_size;
+      resource->mip_levels.push_back(dst_mip);
+    }
   } else {
     resource->payload = std::move(payload);
     resource->detile_jobs = std::move(detile_jobs);
@@ -19488,7 +19691,9 @@ Gta4NativeGraphicsSystem::NativeTextureImage* Gta4NativeGraphicsSystem::GetOrCre
     return existing->second.get();
   }
   protected_texture_generations_.insert(texture->generation);
-  const VkFormat format = ConvertTextureFormat(texture->info.format);
+  const VkFormat format = texture->custom_texture_replacement
+                              ? texture->mod_vk_format
+                              : ConvertTextureFormat(texture->info.format);
   if (format == VK_FORMAT_UNDEFINED) {
     return reject("format");
   }
@@ -19524,7 +19729,7 @@ Gta4NativeGraphicsSystem::NativeTextureImage* Gta4NativeGraphicsSystem::GetOrCre
   image->height = image->logical_height;
   NativeVirtualResourceRecord virtual_registration{};
   bool has_virtual_registration = false;
-  {
+  if (!texture->custom_texture_replacement) {
     std::lock_guard lock(texture_resource_mutex_);
     const NativeVirtualResourceRecord* registered =
         virtual_resource_registry_.Find(texture->handle);
@@ -19543,8 +19748,11 @@ Gta4NativeGraphicsSystem::NativeTextureImage* Gta4NativeGraphicsSystem::GetOrCre
     image->width = packed_source->width;
     image->height = packed_source->height;
   }
-  const NativeReflectionTarget* reflection_entry = FindNativeReflectionTexture(
-      reflection_resources_, texture->handle, image->logical_width, image->logical_height);
+  const NativeReflectionTarget* reflection_entry =
+      texture->custom_texture_replacement
+          ? nullptr
+          : FindNativeReflectionTexture(reflection_resources_, texture->handle,
+                                        image->logical_width, image->logical_height);
   if (reflection_entry) {
     image->reflection = *reflection_entry;
     image->is_reflection = true;
@@ -19648,8 +19856,9 @@ Gta4NativeGraphicsSystem::NativeTextureImage* Gta4NativeGraphicsSystem::GetOrCre
   view_info.format = format;
   uint32_t host_swizzle = GuestToNativeHostSwizzle(
       texture->fetch.swizzle, GetNativeHostFormatSwizzle(texture->info.format));
-  if (texture->packed_depth_source) {
-    // The packed conversion applies the guest swizzle on every host.
+  if (texture->custom_texture_replacement || texture->packed_depth_source) {
+    // Custom DDS packs and packed depth conversions already store host channels
+    // in standard order across every host.
     view_info.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
                             VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
   } else if (texture->vector_font_replacement) {
@@ -19972,6 +20181,12 @@ Gta4NativeGraphicsSystem::NativeSampler* Gta4NativeGraphicsSystem::GetOrCreateSa
     key.mip_filter = xenos::TextureFilter::kLinear;
     key.mip_min_level = 0;
     key.mip_max_level = image->mip_levels - 1;
+  } else if (image && image->source && image->source->custom_texture_replacement) {
+    key.mip_min_level = 0;
+    key.mip_max_level = image->mip_levels ? image->mip_levels - 1 : 0;
+    if (key.mip_filter == xenos::TextureFilter::kBaseMap && image->mip_levels > 1) {
+      key.mip_filter = xenos::TextureFilter::kLinear;
+    }
   }
   if (!(format_properties.optimalTilingFeatures &
         VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) {
@@ -39957,6 +40172,7 @@ void Gta4NativeGraphicsSystem::DestroyVulkanWorkerObjects() {
 
 void Gta4NativeGraphicsSystem::Shutdown() {
   StopTextureWatch();
+  custom_texture_pack_.Shutdown();
   if (presenter_) presenter_->CancelFramePacingWaits();
   if (render_worker_running_.exchange(false)) {
     render_condition_.notify_all();

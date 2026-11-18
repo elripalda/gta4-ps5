@@ -43,6 +43,7 @@
 
 #include "postfx_resource_pool.h"
 #include "dirty_state_delta.h"
+#include "native_texture_pack.h"
 #include "frame_constant_arena.h"
 #include "native_constant_upload.h"
 #include "native_working_set.h"
@@ -441,6 +442,10 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     bool gpu_produced = false;
     bool vector_font_replacement = false;
     uint32_t vector_font_id = 0;
+    VkFormat mod_vk_format = VK_FORMAT_UNDEFINED;
+    bool custom_texture_replacement = false;
+    uint64_t custom_texture_hash = 0;
+    uint64_t custom_texture_pack_generation = 0;
     // Render worker only: the assembly epoch in which this resource's
     // generations were last added to assembly_texture_protection_.
     mutable uint32_t assembly_protection_epoch = 0;
@@ -2596,6 +2601,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
 
   // Indexed by physical frame slot; never swapped with the hot-member aliases.
   std::array<std::vector<NativeBulbFullProbe>, 2> bulb_full_probes_;
+  NativeTexturePack custom_texture_pack_;
   uint32_t bulb_full_frame_ = 0;
   uint64_t bulb_full_bytes_ = 0;
   bool NeedsBulbInterference(const NativeCommand& command, const NativeRenderingTarget& target) const;

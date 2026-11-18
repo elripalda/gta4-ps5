@@ -22,6 +22,8 @@ void Show(rex::ui::ImGuiDrawer* drawer, rex::ui::ImmediateDrawer* immediate, con
           std::function<void()> launch);
 // Xbox 360 save import on the Saves page (before Show).
 void SetSaveImport(Hub::SaveImport import);
+// PC texture mod import on the Display page (before Show).
+void SetTextureModImport(Hub::TextureModImport import);
 // The Refresh Rate's switch on the Display page (before Show).
 void SetDisplay(Hub::Display display);
 // The port's version ("1.0t1": the hub shows "1.0 Test 1"), from ps5/VERSION.txt.
